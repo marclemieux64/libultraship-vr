@@ -1,5 +1,6 @@
 #define NOMINMAX
 
+#include <cstring>
 #include "vr_openxr.h"
 
 #ifdef ENABLE_DX11
