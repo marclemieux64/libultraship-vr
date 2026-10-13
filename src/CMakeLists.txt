@@ -101,19 +101,18 @@ target_link_libraries(libultraship PUBLIC tinyxml2::tinyxml2)
 find_package(spdlog REQUIRED)
 target_link_libraries(libultraship PUBLIC spdlog::spdlog)
 
-find_package(glm REQUIRED)
-target_link_libraries(libultraship PUBLIC glm::glm)
-
 # SOH [VR] OpenXR runtime loader: Windows (vcpkg) and Android (Khronos loader AAR via Gradle
 # prefab, Android/app/build.gradle); the VR layer stubs out elsewhere.
 # ENABLE_VR = the OpenXR core is compiled; which renderers get VR is vr_backend_supported().
 if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
     find_package(OpenXR CONFIG REQUIRED)
-    target_link_libraries(libultraship PRIVATE OpenXR::openxr_loader)
+    find_package(glm REQUIRED)
+    target_link_libraries(libultraship PRIVATE OpenXR::openxr_loader glm::glm)
     target_compile_definitions(libultraship PRIVATE ENABLE_VR)
 elseif (CMAKE_SYSTEM_NAME STREQUAL "Android")
     find_package(OpenXR CONFIG REQUIRED)
-    target_link_libraries(libultraship PRIVATE OpenXR::openxr_loader EGL android log)
+    find_package(glm REQUIRED)
+    target_link_libraries(libultraship PRIVATE OpenXR::openxr_loader EGL android log glm::glm)
     target_compile_definitions(libultraship PRIVATE ENABLE_VR)
 endif()
 
