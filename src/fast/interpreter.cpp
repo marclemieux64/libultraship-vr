@@ -5438,7 +5438,11 @@ void Interpreter::ResetFrameBuffer() {
         vr_rebind_current_eye_target();
         return;
     }
-    mRapi->StartDrawToFramebuffer(0, (float)mCurDimensions.height / mNativeDimensions.height);
+    // Preserve the original flat-renderer target. With internal-resolution scaling or MSAA the
+    // game renders into mGameFb, not framebuffer 0; returning to 0 here sends the pause backdrop
+    // and menu to a target that the final window composite does not display.
+    mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0,
+                                  (float)mCurDimensions.height / mNativeDimensions.height);
 }
 
 void Interpreter::AdjustPixelDepthCoordinates(float& x, float& y) {
