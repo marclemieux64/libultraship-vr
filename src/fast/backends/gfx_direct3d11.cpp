@@ -1,8 +1,9 @@
 #ifdef ENABLE_DX11
 
 #include <cstdio>
-#include <vector>
 #include <cmath>
+#include <utility>
+#include <vector>
 
 #include <map>
 #include <unordered_map>
@@ -277,6 +278,11 @@ void GfxRenderingAPIDX11::Init() {
         mContext->Flush();
 
         mLastShaderProgram = nullptr;
+        mLastGeometryShader = nullptr;
+        mGeometryShaderStateKnown = true; // ClearState guarantees a null geometry stage.
+        mMultiviewTarget = false;
+        mVrEyeCbBound = false;
+        mVrEyeGeneration = UINT32_MAX;
         mLastBlendState.Reset();
         for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
             mLastResourceViews[i].Reset();
@@ -447,6 +453,90 @@ void GfxRenderingAPIDX11::LoadShader(struct ShaderProgram* new_prg) {
 
 void GfxRenderingAPIDX11::ClearShaderCache() {
     mShaderProgramPool.clear();
+    mShaderProgram = nullptr;
+    mLastShaderProgram = nullptr;
+    mLastGeometryShader = nullptr;
+    mGeometryShaderStateKnown = !mMultiviewTarget;
+}
+
+// SOH [VR] Add a geometry shader to the already-expanded Prism HLSL at runtime. Shaders live in
+// soh.o2r, which is not rebuilt by an ordinary C++ build, so doing the same kind of source rewrite
+// as the GLES multiview path keeps the executable and an existing archive compatible. Embedding
+// PSInput in the GS output preserves every generated/custom varying without having to enumerate
+// them; HLSL flattens their semantics at the GS/rasterizer boundary.
+static std::string MakeMultiviewGeometryShader(const std::string& shader) {
+    std::string gs;
+    gs.reserve(shader.size() + 1024);
+    gs = shader;
+    gs += R"(
+
+struct VrGSOutput {
+    PSInput vertex;
+    uint vrLayer : SV_RenderTargetArrayIndex;
+};
+
+cbuffer VrEyeCB : register(b3) {
+    column_major float4x4 uVrEyeMtx[2];
+};
+
+[maxvertexcount(6)]
+void GSMain(triangle PSInput vertices[3], inout TriangleStream<VrGSOutput> stream) {
+    [unroll]
+    for (uint eye = 0; eye < 2; ++eye) {
+        [unroll]
+        for (uint vertex = 0; vertex < 3; ++vertex) {
+            VrGSOutput result;
+            result.vertex = vertices[vertex];
+            result.vertex.position = mul(uVrEyeMtx[eye], vertices[vertex].position);
+            result.vrLayer = eye;
+            stream.Append(result);
+        }
+        stream.RestartStrip();
+    }
+}
+)";
+    return gs;
+}
+
+bool GfxRenderingAPIDX11::EnsureMultiviewGeometryShader(struct ShaderProgramD3D11* prg) {
+    if (prg->multiview_geometry_shader) {
+        return true;
+    }
+    if (prg->multiview_geometry_shader_tried) {
+        return false;
+    }
+    prg->multiview_geometry_shader_tried = true;
+
+    const std::string multiviewShader = MakeMultiviewGeometryShader(prg->multiview_shader_source);
+#if DEBUG_D3D
+    const UINT compileFlags = D3DCOMPILE_DEBUG;
+#else
+    const UINT compileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
+#endif
+    ComPtr<ID3DBlob> gs;
+    ComPtr<ID3DBlob> errorBlob;
+    const HRESULT compileHr =
+        mD3dCompile(multiviewShader.data(), multiviewShader.size(), nullptr, nullptr, nullptr, "GSMain", "gs_4_0",
+                    compileFlags, 0, gs.GetAddressOf(), errorBlob.GetAddressOf());
+    if (FAILED(compileHr)) {
+        const char* err = errorBlob ? static_cast<const char*>(errorBlob->GetBufferPointer()) : "Unknown error";
+        SPDLOG_ERROR("[VR] D3D11 multiview geometry shader failed for combiner {:x}/{:x}: {}", prg->shader_id0,
+                     prg->shader_id1, err);
+        prg->multiview_shader_source.clear();
+        prg->multiview_shader_source.shrink_to_fit();
+        return false;
+    }
+
+    const HRESULT createHr = mDevice->CreateGeometryShader(gs->GetBufferPointer(), gs->GetBufferSize(), nullptr,
+                                                           prg->multiview_geometry_shader.GetAddressOf());
+    prg->multiview_shader_source.clear();
+    prg->multiview_shader_source.shrink_to_fit();
+    if (FAILED(createHr)) {
+        SPDLOG_ERROR("[VR] D3D11 could not create multiview geometry shader for combiner {:x}/{:x} (0x{:08x})",
+                     prg->shader_id0, prg->shader_id1, (uint32_t)createHr);
+        return false;
+    }
+    return true;
 }
 
 struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shader_id0, uint64_t shader_id1) {
@@ -495,6 +585,9 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
                                               prg->vertex_shader.GetAddressOf()));
     ThrowIfFailed(mDevice->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr,
                                              prg->pixel_shader.GetAddressOf()));
+    prg->multiview_geometry_shader.Reset();
+    prg->multiview_geometry_shader_tried = false;
+    prg->multiview_shader_source = std::move(shader);
 
     // Input Layout
 
@@ -890,6 +983,54 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         mContext->PSSetShader(mShaderProgram->pixel_shader.Get(), 0, 0);
     }
 
+    // The same combiner can draw first into EyeArray and then into an ordinary HUD/offscreen
+    // target. Track the geometry stage independently from the VS/PS program cache so that switch
+    // binds (and, critically, unbinds) the layered shader even when the combiner did not change.
+    if (mMultiviewTarget && !EnsureMultiviewGeometryShader(mShaderProgram)) {
+        // Never draw a center-eye image into only one layer. Hardware support is checked before
+        // EyeArray creation, so reaching this means shader generation/compilation failed and was
+        // already logged once for this program.
+        return;
+    }
+    ID3D11GeometryShader* geometryShader = mMultiviewTarget ? mShaderProgram->multiview_geometry_shader.Get() : nullptr;
+    if (!mGeometryShaderStateKnown || mLastGeometryShader != geometryShader) {
+        mContext->GSSetShader(geometryShader, nullptr, 0);
+        mLastGeometryShader = geometryShader;
+        mGeometryShaderStateKnown = true;
+    }
+
+    if (mMultiviewTarget) {
+        if (!mPerVrEyeCb) {
+            D3D11_BUFFER_DESC eyeBufferDesc = {};
+            eyeBufferDesc.Usage = D3D11_USAGE_DYNAMIC;
+            eyeBufferDesc.ByteWidth = sizeof(PerVrEyeCB);
+            eyeBufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            eyeBufferDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+            const HRESULT createEyeBuffer = mDevice->CreateBuffer(&eyeBufferDesc, nullptr, mPerVrEyeCb.GetAddressOf());
+            if (FAILED(createEyeBuffer)) {
+                SPDLOG_ERROR("[VR] D3D11 could not create the eye-matrix constant buffer (0x{:08x})",
+                             (uint32_t)createEyeBuffer);
+                return;
+            }
+            mVrEyeGeneration = UINT32_MAX;
+        }
+        uint32_t generation = 0;
+        const float* eyeMtx = vr_get_multiview_eye_matrices(&generation);
+        if (generation != mVrEyeGeneration) {
+            memcpy(mPerVrEyeCbData.eye_mtx, eyeMtx, sizeof(mPerVrEyeCbData.eye_mtx));
+            D3D11_MAPPED_SUBRESOURCE eyeMs = {};
+            ThrowIfFailed(mContext->Map(mPerVrEyeCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &eyeMs));
+            memcpy(eyeMs.pData, &mPerVrEyeCbData, sizeof(mPerVrEyeCbData));
+            mContext->Unmap(mPerVrEyeCb.Get(), 0);
+            mVrEyeGeneration = generation;
+        }
+        if (!mVrEyeCbBound) {
+            ID3D11Buffer* eyeBuffer = mPerVrEyeCb.Get();
+            mContext->GSSetConstantBuffers(3, 1, &eyeBuffer);
+            mVrEyeCbBound = true;
+        }
+    }
+
     // Checked per draw, not per program switch: the same program draws into the eyes and the
     // HUD/text quads within one frame.
     ID3D11BlendState* blend = mShaderProgram->blend_state.Get();
@@ -1026,7 +1167,7 @@ void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width,
 
 void GfxRenderingAPIDX11::StartDrawToFramebuffer(int fb_id, float noise_scale) {
     FramebufferDX11& fb = mFrameBuffers[fb_id];
-    mRenderTargetHeight = mTextures[fb.texture_id].height;
+    SetExternalRenderTarget((int32_t)mTextures[fb.texture_id].height, false);
 
     mContext->OMSetRenderTargets(1, fb.render_target_view.GetAddressOf(),
                                  fb.has_depth_buffer ? fb.depth_stencil_view.Get() : nullptr);

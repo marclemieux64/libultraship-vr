@@ -46,7 +46,7 @@ bool vr_should_present_desktop();
 // by the VR Settings performance section; purely diagnostic.
 struct VrFrameStats {
     float wait_ms;    // blocked inside xrWaitFrame — this is spare headroom, higher is better
-    float eyes_ms;    // both eye display-list passes
+    float eyes_ms;    // stereo eye rendering (one single-pass traversal or two ordinary passes)
     float hud_ms;     // HUD quad pass
     float desktop_ms; // companion window: ImGui + mirror blit + Present
     float frame_ms;   // whole DrawAndRunGraphicsCommands
@@ -65,7 +65,7 @@ void vr_get_frame_stats(struct VrFrameStats* out);
 void vr_begin_eye(int eye);
 void vr_end_eye(int eye);
 
-// Single-pass stereo (multiview, GLES). When vr_multiview_enabled(), the frame loop draws the eyes
+// Single-pass stereo (multiview). When vr_multiview_enabled(), the frame loop draws the eyes
 // with ONE interpreter run between vr_begin_stereo / vr_end_stereo instead of two eye passes. The
 // run sees eye kCenterEye (2): a culling camera whose view contains both eyes'; the renderer's
 // multiview programs move each vertex into each eye with vr_get_multiview_eye_matrices (two

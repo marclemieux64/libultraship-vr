@@ -32,6 +32,13 @@ struct PerPrimDepthCB {
     float _pad[3]; // 16-byte CB alignment
 };
 
+// SOH [VR] Two clip-space transforms for D3D11 single-pass stereo. The CPU stores the matrices
+// row-major; HLSL's default column-major interpretation plus mul(matrix, vector) performs the
+// transpose needed to turn the engine's row-vector transform into a shader column-vector one.
+struct PerVrEyeCB {
+    float eye_mtx[2][16];
+};
+
 struct Coord {
     int x, y;
 };
@@ -56,6 +63,13 @@ struct FramebufferDX11 {
 
 struct ShaderProgramD3D11 {
     Microsoft::WRL::ComPtr<ID3D11VertexShader> vertex_shader;
+    // SOH [VR] Duplicates each triangle into the two slices of an OpenXR EyeArray target. Kept
+    // beside the combiner because its input/output signature contains that combiner's varyings.
+    Microsoft::WRL::ComPtr<ID3D11GeometryShader> multiview_geometry_shader;
+    // Retained only until the program is first used on EyeArray. This makes GS compilation fully
+    // lazy, so flat/non-VR shader creation follows exactly its old VS+PS path.
+    std::string multiview_shader_source;
+    bool multiview_geometry_shader_tried = false;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> pixel_shader;
     Microsoft::WRL::ComPtr<ID3D11InputLayout> input_layout;
     Microsoft::WRL::ComPtr<ID3D11BlendState> blend_state;
@@ -129,10 +143,32 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     GfxWindowBackendDXGI* mWindowBackend = nullptr;
     D3D_FEATURE_LEVEL mFeatureLevel;
 
-    // SOH [VR] The VR layer binds OpenXR swapchain RTVs directly (outside the framebuffer map), so
-    // it must be able to tell the backend the bound target's height for the viewport/scissor Y-flip.
-    void SetRenderTargetHeight(int32_t height) {
+    // SOH [VR] The VR layer binds OpenXR swapchain RTVs directly (outside the framebuffer map).
+    // Tell the renderer both the height needed by viewport/scissor Y-flips and whether draws must
+    // use the layered geometry-shader path. Ordinary targets always pass multiview=false.
+    void SetExternalRenderTarget(int32_t height, bool multiview) {
         mRenderTargetHeight = height;
+        if (mMultiviewTarget != multiview) {
+            mMultiviewTarget = multiview;
+            mVrEyeCbBound = false;
+            if (!multiview && mContext) {
+                // Do this at the target boundary, not on every ordinary draw. A flat-only run
+                // never touches the geometry-shader stage.
+                mContext->GSSetShader(nullptr, nullptr, 0);
+                mLastGeometryShader = nullptr;
+                mGeometryShaderStateKnown = true;
+            } else {
+                mGeometryShaderStateKnown = false;
+                // A newly created OpenXR session can restart its generation counter, so force the
+                // first EyeArray draw to upload rather than trusting a value from an old session.
+                mVrEyeGeneration = UINT32_MAX;
+            }
+        }
+    }
+
+    // Kept for callers that only bind an ordinary single-layer target.
+    void SetRenderTargetHeight(int32_t height) {
+        SetExternalRenderTarget(height, false);
     }
 
     // SOH [VR] Which GPU the device is created on, set before Init (Fast3dWindow::Init, only when VR
@@ -142,6 +178,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     bool mPreferHighPerformance = false;
 
   private:
+    bool EnsureMultiviewGeometryShader(struct ShaderProgramD3D11* prg);
     void CreateDepthStencilObjects(uint32_t width, uint32_t height, uint32_t msaa_count, ID3D11DepthStencilView** view,
                                    ID3D11ShaderResourceView** srv);
 
@@ -163,6 +200,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerFrameCb;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerDrawCb;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerPrimDepthCb;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mPerVrEyeCb;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mCoordBuffer;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mCoordBufferSrv;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mDepthValueOutputBuffer;
@@ -180,6 +218,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     PerFrameCB mPerFrameCbData;
     PerDrawCB mPerDrawCbData;
     PerPrimDepthCB mPerPrimDepthCbData;
+    PerVrEyeCB mPerVrEyeCbData = {};
 
     std::map<std::pair<uint64_t, uint32_t>, struct ShaderProgramD3D11> mShaderProgramPool;
 
@@ -200,6 +239,11 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // Previous states (to prevent setting states needlessly)
 
     struct ShaderProgramD3D11* mLastShaderProgram = nullptr;
+    ID3D11GeometryShader* mLastGeometryShader = nullptr;
+    bool mGeometryShaderStateKnown = true;
+    bool mMultiviewTarget = false;
+    bool mVrEyeCbBound = false;
+    uint32_t mVrEyeGeneration = UINT32_MAX;
     Microsoft::WRL::ComPtr<ID3D11BlendState> mLastBlendState = nullptr;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mLastResourceViews[SHADER_MAX_TEXTURES] = { nullptr, nullptr };
     Microsoft::WRL::ComPtr<ID3D11SamplerState> mLastSamplerStates[SHADER_MAX_TEXTURES] = { nullptr, nullptr };

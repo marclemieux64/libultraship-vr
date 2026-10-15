@@ -108,6 +108,8 @@ class D3D11Backend final : public Backend {
         Detach(t);
         sc.width = w;
         sc.height = h;
+        const bool multiview = t == Target::EyeArray;
+        const UINT layerCount = multiview ? 2u : 1u;
 
         uint32_t count = 0;
         xrEnumerateSwapchainImages(handle, 0, &count, nullptr);
@@ -119,10 +121,27 @@ class D3D11Backend final : public Backend {
         sc.depth.resize(count);
 
         for (uint32_t i = 0; i < count; i++) {
+            D3D11_TEXTURE2D_DESC color_desc = {};
+            sc.images[i].texture->GetDesc(&color_desc);
+            if (color_desc.ArraySize < layerCount) {
+                spdlog::error("[VR] Target {} image {} has {} layers, but {} are required", (int)t, i,
+                              color_desc.ArraySize, layerCount);
+                return false;
+            }
+
             D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
             rtv_desc.Format = mViewFormat;
-            rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-            rtv_desc.Texture2D.MipSlice = 0;
+            if (multiview) {
+                // One view spans both OpenXR swapchain layers. The multiview geometry shader selects
+                // the destination eye with SV_RenderTargetArrayIndex.
+                rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+                rtv_desc.Texture2DArray.MipSlice = 0;
+                rtv_desc.Texture2DArray.FirstArraySlice = 0;
+                rtv_desc.Texture2DArray.ArraySize = layerCount;
+            } else {
+                rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+                rtv_desc.Texture2D.MipSlice = 0;
+            }
             HRESULT hr = mDevice->CreateRenderTargetView(sc.images[i].texture, &rtv_desc, sc.rtvs[i].GetAddressOf());
             if (FAILED(hr)) {
                 spdlog::error("[VR] Failed to create RTV for target {} image {} (0x{:08x})", (int)t, i, (uint32_t)hr);
@@ -133,7 +152,7 @@ class D3D11Backend final : public Backend {
             depth_desc.Width = w;
             depth_desc.Height = h;
             depth_desc.MipLevels = 1;
-            depth_desc.ArraySize = 1;
+            depth_desc.ArraySize = layerCount;
             depth_desc.Format = DXGI_FORMAT_D32_FLOAT;
             depth_desc.SampleDesc.Count = 1;
             depth_desc.Usage = D3D11_USAGE_DEFAULT;
@@ -147,8 +166,15 @@ class D3D11Backend final : public Backend {
 
             D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc = {};
             dsv_desc.Format = DXGI_FORMAT_D32_FLOAT;
-            dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
-            dsv_desc.Texture2D.MipSlice = 0;
+            if (multiview) {
+                dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
+                dsv_desc.Texture2DArray.MipSlice = 0;
+                dsv_desc.Texture2DArray.FirstArraySlice = 0;
+                dsv_desc.Texture2DArray.ArraySize = layerCount;
+            } else {
+                dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+                dsv_desc.Texture2D.MipSlice = 0;
+            }
             hr = mDevice->CreateDepthStencilView(sc.depth[i].Get(), &dsv_desc, sc.dsvs[i].GetAddressOf());
             if (FAILED(hr)) {
                 spdlog::error("[VR] Failed to create DSV for target {} image {} (0x{:08x})", (int)t, i, (uint32_t)hr);
@@ -189,7 +215,7 @@ class D3D11Backend final : public Backend {
         mContext->RSSetViewports(1, &viewport);
 
         // The backend's viewport/scissor Y-flip needs the bound target's height.
-        mDx->SetRenderTargetHeight((int32_t)sc.height);
+        mDx->SetExternalRenderTarget((int32_t)sc.height, t == Target::EyeArray);
     }
 
     void Rebind(Target t, uint32_t image) override {
@@ -200,7 +226,7 @@ class D3D11Backend final : public Backend {
         ID3D11RenderTargetView* rtv = sc.rtvs[image].Get();
         ID3D11DepthStencilView* dsv = sc.dsvs[image].Get();
         mContext->OMSetRenderTargets(1, &rtv, dsv);
-        mDx->SetRenderTargetHeight((int32_t)sc.height);
+        mDx->SetExternalRenderTarget((int32_t)sc.height, t == Target::EyeArray);
     }
 
     void ClearDepth(Target t, uint32_t image) override {
@@ -234,7 +260,7 @@ class D3D11Backend final : public Backend {
     }
 
     // A swapchain image can't be read after release, so each pass copies its image here while still
-    // acquired. Same family + size as the source, so a straight CopyResource is valid.
+    // acquired. EyeArray is a two-layer texture; only layer 0 (the left eye) goes to the desktop.
     void CopyToMirror(Target t, uint32_t image, int slot) override {
         auto& sc = mTargets[(int)t];
         if (slot < 0 || slot >= kMirrorCount || image >= sc.images.size() || sc.images[image].texture == nullptr) {
@@ -276,7 +302,10 @@ class D3D11Backend final : public Backend {
             c.w = sd.Width;
             c.h = sd.Height;
         }
-        mContext->CopyResource(c.tex.Get(), src);
+        // Copying a two-layer source with CopyResource into the one-layer mirror is invalid. A
+        // subresource copy works for both ordinary targets and EyeArray and preserves the raw bits.
+        const UINT srcSubresource = D3D11CalcSubresource(0, 0, sd.MipLevels);
+        mContext->CopySubresourceRegion(c.tex.Get(), 0, 0, 0, 0, src, srcSubresource, nullptr);
     }
 
     void* MirrorTextureId(int slot) override {
@@ -288,6 +317,12 @@ class D3D11Backend final : public Backend {
 
     bool MirrorFlipV() const override {
         return false;
+    }
+
+    bool SupportsMultiview() const override {
+        // Feature level 10 includes geometry shaders and render-target arrays. The renderer uses a
+        // geometry shader to duplicate each triangle into the two OpenXR array layers.
+        return mDevice != nullptr && mDevice->GetFeatureLevel() >= D3D_FEATURE_LEVEL_10_0;
     }
 
     void Shutdown() override {

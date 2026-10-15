@@ -157,7 +157,7 @@ static struct {
     float projection[3][4][4];
     float view[3][4][4];
 
-    // Single-pass stereo (multiview, GLES): both eyes in one two-layer swapchain (eye_swapchains[0]
+    // Single-pass stereo (multiview): both eyes in one two-layer swapchain (eye_swapchains[0]
     // holds it; [1] keeps only the size), drawn by ONE interpreter run from the center camera. The
     // GPU moves each vertex from the center camera's clip space into each eye's with mv_eye_mtx
     // (one 4x4 per layer); eye-welded 2D (texrects, fills) uses identity instead (mv_welded).
