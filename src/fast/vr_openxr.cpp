@@ -1276,6 +1276,7 @@ static struct {
     uint16_t latch_buttons[2];
     bool latch_trigger[2], latch_squeeze[2], latch_stick[2];
 } g_menu = { false, {}, {}, false, false, 0.0, 0.0, -1 };
+static bool g_notifications_visible = false;
 
 static std::shared_ptr<Ship::GuiWindow> vr_menu_window() {
     Ship::Context* ctx = Ship::Context::GetRawInstance();
@@ -1484,7 +1485,20 @@ static void vr_menu_fill_beam() {
 }
 
 bool vr_menu_panel_active() {
+    return xr.initialized && xr.enabled && xr.session_running && (g_menu.open || g_notifications_visible);
+}
+
+bool vr_menu_interactive() {
     return xr.initialized && xr.enabled && xr.session_running && g_menu.open;
+}
+
+void vr_set_notifications_visible(bool visible) {
+    if (visible && !g_notifications_visible) {
+        // Do not expose the previous interactive-menu image for one frame while the notification
+        // ImGui draw data is still being rendered into this shared transparent swapchain.
+        xr.menu_ever_rendered = false;
+    }
+    g_notifications_visible = visible;
 }
 
 void vr_menu_panel_size(int* w, int* h) {
@@ -3569,20 +3583,26 @@ void vr_end_frame() {
     // the head so it reads as a line from any angle.
     XrCompositionLayerQuad menu_layer = { XR_TYPE_COMPOSITION_LAYER_QUAD };
     XrCompositionLayerQuad beam_layer = { XR_TYPE_COMPOSITION_LAYER_QUAD };
-    const bool menu_visible = g_menu.open && xr.menu_ever_rendered;
+    const bool notification_visible = g_notifications_visible && !g_menu.open;
+    const bool menu_visible = (g_menu.open || notification_visible) && xr.menu_ever_rendered;
     bool beam_visible = false;
     if (menu_visible) {
         menu_layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
         menu_layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-        menu_layer.space = xr.local_space;
+        menu_layer.space = notification_visible ? xr.view_space : xr.local_space;
         menu_layer.subImage.swapchain = xr.menu_swapchain.handle;
         menu_layer.subImage.imageRect.offset = { 0, 0 };
         menu_layer.subImage.imageRect.extent = { (int32_t)xr.menu_swapchain.width, (int32_t)xr.menu_swapchain.height };
-        menu_layer.pose = g_menu.pose;
-        menu_layer.size = { g_menu.size[0], g_menu.size[1] };
+        if (notification_visible) {
+            menu_layer.pose = { { 0, 0, 0, 1 }, { 0.0f, 0.0f, -1.35f } };
+            menu_layer.size = { 1.4f, 1.4f * (float)kMenuPanelH / (float)kMenuPanelW };
+        } else {
+            menu_layer.pose = g_menu.pose;
+            menu_layer.size = { g_menu.size[0], g_menu.size[1] };
+        }
 
         const int bh = g_menu.hand;
-        if (xr.beam_ready && bh >= 0 && xr.hand_active[bh] && xr.head_raw_valid) {
+        if (g_menu.open && xr.beam_ready && bh >= 0 && xr.hand_active[bh] && xr.head_raw_valid) {
             const XrPosef& a = xr.aim_pose_raw[bh];
             const glm::vec3 o(a.position.x, a.position.y, a.position.z);
             const glm::vec3 d = glm::normalize(
@@ -5763,6 +5783,8 @@ void vr_begin_text() {}
 void vr_end_text() {}
 bool vr_is_rendering_text() { return false; }
 bool vr_menu_panel_active() { return false; }
+bool vr_menu_interactive() { return false; }
+void vr_set_notifications_visible(bool) {}
 bool vr_can_disable() { return true; }
 int vr_get_supported_refresh_rates(float*, int) { return 0; }
 void vr_menu_panel_size(int* w, int* h) { *w = 0; *h = 0; }

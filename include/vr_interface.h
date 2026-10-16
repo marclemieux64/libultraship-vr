@@ -100,6 +100,9 @@ void VR_SetLinkEyeHeight(float units);
 // Alyx-style comfort fade: 0 = clear, 1 = world layer black (menus/HUD unaffected). The game sets
 // this each tick from how far the player's physical head sits beyond solid geometry.
 void VR_SetViewFade(float fade);
+// Makes the existing ImGui notification windows available on a passive headset panel. This does
+// not open the interactive SoH menu or consume controller input.
+void VR_SetNotificationsVisible(bool visible);
 // Third person: the game camera's facing (binang yaw) becomes the playspace's base orientation,
 // so looking straight ahead in the headset looks where the stock camera looks (cutscenes too).
 void VR_SetCameraYaw(int16_t yaw_binang);

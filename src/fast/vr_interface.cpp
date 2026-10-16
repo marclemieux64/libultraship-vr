@@ -77,6 +77,10 @@ void VR_SetViewFade(float fade) {
     vr_set_view_fade(fade);
 }
 
+void VR_SetNotificationsVisible(bool visible) {
+    vr_set_notifications_visible(visible);
+}
+
 void VR_SetCameraYaw(int16_t yaw_binang) {
     vr_set_camera_yaw(yaw_binang);
 }

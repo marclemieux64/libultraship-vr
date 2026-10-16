@@ -254,6 +254,8 @@ struct VrMenuPointer {
     int hand;
 };
 bool vr_menu_panel_active();
+bool vr_menu_interactive();
+void vr_set_notifications_visible(bool visible);
 // False on standalone headsets (Android): VR can't be switched off there (no flat screen exists);
 // the VR Mode checkbox and F9 are hidden / ignored, and doffing never drops to flat.
 bool vr_can_disable();
