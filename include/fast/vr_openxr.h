@@ -72,6 +72,9 @@ void vr_end_eye(int eye);
 // row-major 4x4s, clip_eye = clip_center * M; identity while eye-welded 2D is drawn). The
 // generation changes whenever the returned matrices do.
 bool vr_multiview_enabled();
+// True once the active graphics backend has uploaded at least one valid OpenXR hidden-area mask.
+// False covers disabled, unsupported, not-yet-initialized, and all safe fallback paths.
+bool vr_visibility_mask_enabled();
 void vr_begin_stereo();
 void vr_end_stereo();
 bool vr_is_multiview_pass();
@@ -88,6 +91,8 @@ void vr_get_fog_ndc_z_params(float* a, float* b);
 
 // State queries
 bool vr_is_initialized();
+// True only while the OpenXR session is focused and accepting headset/controller input.
+bool vr_is_session_focused();
 int vr_get_current_eye();
 void vr_get_recommended_resolution(uint32_t* width, uint32_t* height);
 // Headset display refresh rate in Hz (e.g. 72/90/120). Used to pace the game's fixed-timestep

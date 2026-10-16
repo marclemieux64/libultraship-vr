@@ -106,6 +106,24 @@ class Backend {
         return false;
     }
 
+    // OpenXR hidden-area mask. The core enables this only when XR_KHR_visibility_mask supplies a
+    // valid hidden-triangle mesh. Backends that support it allocate stencil-capable eye depth
+    // targets, then receive per-eye vertices already projected to clip-space XY. Ordinary
+    // backends retain the full-frame path through these default implementations.
+    virtual bool ConfigureVisibilityMask(bool enable) {
+        return !enable;
+    }
+    virtual void SetVisibilityMask(uint32_t eye, const float* clipXy, uint32_t vertexCount,
+                                   const uint32_t* indices, uint32_t indexCount) {
+    }
+    // Per-pass eye policy (bit 0 = left, bit 1 = right). The core excludes the left eye when it
+    // will be copied to the desktop companion, while a layered pass can still mask the right eye.
+    virtual void SetVisibilityMaskEyesForPass(uint32_t eyeMask) {
+    }
+    virtual bool VisibilityMaskActive() const {
+        return false;
+    }
+
     virtual void Shutdown() = 0;
 };
 

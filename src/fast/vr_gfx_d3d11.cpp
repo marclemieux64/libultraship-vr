@@ -11,6 +11,8 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
+#include <array>
+
 #include <spdlog/spdlog.h>
 
 #include "vr_gfx.h"
@@ -103,6 +105,83 @@ class D3D11Backend final : public Backend {
         return chosen;
     }
 
+    bool ConfigureVisibilityMask(bool enable) override {
+        mVisibilityMaskConfigured = false;
+        mVisibilityMaskEyesForPass = 0x3u;
+        for (auto& mask : mVisibilityMasks) {
+            mask.vertexBuffer.Reset();
+            mask.indexBuffer.Reset();
+            mask.indexCount = 0;
+        }
+        if (!enable) {
+            return true;
+        }
+
+        UINT support = 0;
+        if (FAILED(mDevice->CheckFormatSupport(DXGI_FORMAT_D32_FLOAT_S8X24_UINT, &support)) ||
+            (support & D3D11_FORMAT_SUPPORT_DEPTH_STENCIL) == 0) {
+            spdlog::info("[VR] Hidden-area mask unavailable: D32_FLOAT_S8X24 depth/stencil is unsupported");
+            return false;
+        }
+        if (!CreateVisibilityMaskPipeline()) {
+            return false;
+        }
+        mVisibilityMaskConfigured = true;
+        return true;
+    }
+
+    void SetVisibilityMask(uint32_t eye, const float* clipXy, uint32_t vertexCount, const uint32_t* indices,
+                           uint32_t indexCount) override {
+        if (eye >= mVisibilityMasks.size()) {
+            return;
+        }
+        auto& mask = mVisibilityMasks[eye];
+        mask.vertexBuffer.Reset();
+        mask.indexBuffer.Reset();
+        mask.indexCount = 0;
+        if (!mVisibilityMaskConfigured || clipXy == nullptr || indices == nullptr || vertexCount == 0 ||
+            indexCount == 0) {
+            return;
+        }
+
+        D3D11_BUFFER_DESC vbDesc = {};
+        vbDesc.ByteWidth = vertexCount * sizeof(float) * 2;
+        vbDesc.Usage = D3D11_USAGE_IMMUTABLE;
+        vbDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        D3D11_SUBRESOURCE_DATA vbData = {};
+        vbData.pSysMem = clipXy;
+        HRESULT hr = mDevice->CreateBuffer(&vbDesc, &vbData, mask.vertexBuffer.GetAddressOf());
+        if (FAILED(hr)) {
+            spdlog::warn("[VR] Hidden-area mask eye {} vertex upload failed (0x{:08x}); rendering the full eye", eye,
+                         (uint32_t)hr);
+            return;
+        }
+
+        D3D11_BUFFER_DESC ibDesc = {};
+        ibDesc.ByteWidth = indexCount * sizeof(uint32_t);
+        ibDesc.Usage = D3D11_USAGE_IMMUTABLE;
+        ibDesc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+        D3D11_SUBRESOURCE_DATA ibData = {};
+        ibData.pSysMem = indices;
+        hr = mDevice->CreateBuffer(&ibDesc, &ibData, mask.indexBuffer.GetAddressOf());
+        if (FAILED(hr)) {
+            spdlog::warn("[VR] Hidden-area mask eye {} index upload failed (0x{:08x}); rendering the full eye", eye,
+                         (uint32_t)hr);
+            mask.vertexBuffer.Reset();
+            return;
+        }
+        mask.indexCount = indexCount;
+    }
+
+    void SetVisibilityMaskEyesForPass(uint32_t eyeMask) override {
+        mVisibilityMaskEyesForPass = eyeMask & 0x3u;
+    }
+
+    bool VisibilityMaskActive() const override {
+        return mVisibilityMaskConfigured &&
+               (mVisibilityMasks[0].indexCount != 0 || mVisibilityMasks[1].indexCount != 0);
+    }
+
     bool Attach(Target t, XrSwapchain handle, uint32_t w, uint32_t h, int64_t fmt) override {
         auto& sc = mTargets[(int)t];
         Detach(t);
@@ -110,6 +189,11 @@ class D3D11Backend final : public Backend {
         sc.height = h;
         const bool multiview = t == Target::EyeArray;
         const UINT layerCount = multiview ? 2u : 1u;
+        const bool eyeTarget = t == Target::Eye0 || t == Target::Eye1 || multiview;
+        const bool useVisibilityMask = eyeTarget && mVisibilityMaskConfigured;
+        const DXGI_FORMAT depthFormat =
+            useVisibilityMask ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : DXGI_FORMAT_D32_FLOAT;
+        sc.hasStencil = useVisibilityMask;
 
         uint32_t count = 0;
         xrEnumerateSwapchainImages(handle, 0, &count, nullptr);
@@ -119,6 +203,9 @@ class D3D11Backend final : public Backend {
         sc.rtvs.resize(count);
         sc.dsvs.resize(count);
         sc.depth.resize(count);
+        if (multiview && useVisibilityMask) {
+            sc.eyeDsvs.resize(count);
+        }
 
         for (uint32_t i = 0; i < count; i++) {
             D3D11_TEXTURE2D_DESC color_desc = {};
@@ -153,19 +240,27 @@ class D3D11Backend final : public Backend {
             depth_desc.Height = h;
             depth_desc.MipLevels = 1;
             depth_desc.ArraySize = layerCount;
-            depth_desc.Format = DXGI_FORMAT_D32_FLOAT;
+            depth_desc.Format = depthFormat;
             depth_desc.SampleDesc.Count = 1;
             depth_desc.Usage = D3D11_USAGE_DEFAULT;
             depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
             hr = mDevice->CreateTexture2D(&depth_desc, nullptr, sc.depth[i].GetAddressOf());
             if (FAILED(hr)) {
+                if (useVisibilityMask) {
+                    spdlog::warn("[VR] Hidden-area stencil depth allocation failed (0x{:08x}); retrying with the "
+                                 "ordinary full-eye renderer",
+                                 (uint32_t)hr);
+                    mVisibilityMaskConfigured = false;
+                    Detach(t);
+                    return Attach(t, handle, w, h, fmt);
+                }
                 spdlog::error("[VR] Failed to create depth texture for target {} image {} (0x{:08x})", (int)t, i,
                               (uint32_t)hr);
                 return false;
             }
 
             D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc = {};
-            dsv_desc.Format = DXGI_FORMAT_D32_FLOAT;
+            dsv_desc.Format = depthFormat;
             if (multiview) {
                 dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
                 dsv_desc.Texture2DArray.MipSlice = 0;
@@ -177,8 +272,37 @@ class D3D11Backend final : public Backend {
             }
             hr = mDevice->CreateDepthStencilView(sc.depth[i].Get(), &dsv_desc, sc.dsvs[i].GetAddressOf());
             if (FAILED(hr)) {
+                if (useVisibilityMask) {
+                    spdlog::warn("[VR] Hidden-area stencil view creation failed (0x{:08x}); retrying with the "
+                                 "ordinary full-eye renderer",
+                                 (uint32_t)hr);
+                    mVisibilityMaskConfigured = false;
+                    Detach(t);
+                    return Attach(t, handle, w, h, fmt);
+                }
                 spdlog::error("[VR] Failed to create DSV for target {} image {} (0x{:08x})", (int)t, i, (uint32_t)hr);
                 return false;
+            }
+
+            if (multiview && useVisibilityMask) {
+                for (UINT eye = 0; eye < 2; ++eye) {
+                    D3D11_DEPTH_STENCIL_VIEW_DESC eyeDsvDesc = {};
+                    eyeDsvDesc.Format = depthFormat;
+                    eyeDsvDesc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
+                    eyeDsvDesc.Texture2DArray.MipSlice = 0;
+                    eyeDsvDesc.Texture2DArray.FirstArraySlice = eye;
+                    eyeDsvDesc.Texture2DArray.ArraySize = 1;
+                    hr = mDevice->CreateDepthStencilView(sc.depth[i].Get(), &eyeDsvDesc,
+                                                         sc.eyeDsvs[i][eye].GetAddressOf());
+                    if (FAILED(hr)) {
+                        spdlog::warn("[VR] Hidden-area eye-slice stencil view failed (0x{:08x}); retrying with the "
+                                     "ordinary full-eye renderer",
+                                     (uint32_t)hr);
+                        mVisibilityMaskConfigured = false;
+                        Detach(t);
+                        return Attach(t, handle, w, h, fmt);
+                    }
+                }
             }
         }
         (void)fmt;
@@ -189,9 +313,11 @@ class D3D11Backend final : public Backend {
         auto& sc = mTargets[(int)t];
         sc.rtvs.clear();
         sc.dsvs.clear();
+        sc.eyeDsvs.clear();
         sc.depth.clear();
         sc.images.clear();
         sc.width = sc.height = 0;
+        sc.hasStencil = false;
     }
 
     void BeginPass(Target t, uint32_t image, const float clearRgba[4]) override {
@@ -203,7 +329,8 @@ class D3D11Backend final : public Backend {
         ID3D11DepthStencilView* dsv = sc.dsvs[image].Get();
         mContext->OMSetRenderTargets(1, &rtv, dsv);
         mContext->ClearRenderTargetView(rtv, clearRgba);
-        mContext->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
+        const UINT clearFlags = D3D11_CLEAR_DEPTH | (sc.hasStencil ? D3D11_CLEAR_STENCIL : 0);
+        mContext->ClearDepthStencilView(dsv, clearFlags, 1.0f, 0);
 
         D3D11_VIEWPORT viewport = {};
         viewport.TopLeftX = 0;
@@ -214,8 +341,9 @@ class D3D11Backend final : public Backend {
         viewport.MaxDepth = 1.0f;
         mContext->RSSetViewports(1, &viewport);
 
+        const bool visibilityMask = DrawVisibilityMask(t, image);
         // The backend's viewport/scissor Y-flip needs the bound target's height.
-        mDx->SetExternalRenderTarget((int32_t)sc.height, t == Target::EyeArray);
+        mDx->SetExternalRenderTarget((int32_t)sc.height, t == Target::EyeArray, visibilityMask);
     }
 
     void Rebind(Target t, uint32_t image) override {
@@ -226,7 +354,7 @@ class D3D11Backend final : public Backend {
         ID3D11RenderTargetView* rtv = sc.rtvs[image].Get();
         ID3D11DepthStencilView* dsv = sc.dsvs[image].Get();
         mContext->OMSetRenderTargets(1, &rtv, dsv);
-        mDx->SetExternalRenderTarget((int32_t)sc.height, t == Target::EyeArray);
+        mDx->SetExternalRenderTarget((int32_t)sc.height, t == Target::EyeArray, HasVisibilityMask(t));
     }
 
     void ClearDepth(Target t, uint32_t image) override {
@@ -334,9 +462,155 @@ class D3D11Backend final : public Backend {
             c.tex.Reset();
             c.w = c.h = 0;
         }
+        ConfigureVisibilityMask(false);
+        mVisibilityMaskVs.Reset();
+        mVisibilityMaskInputLayout.Reset();
+        mVisibilityMaskDepthState.Reset();
+        mVisibilityMaskRasterizerState.Reset();
     }
 
   private:
+    bool CreateVisibilityMaskPipeline() {
+        if (mVisibilityMaskVs && mVisibilityMaskInputLayout && mVisibilityMaskDepthState &&
+            mVisibilityMaskRasterizerState) {
+            return true;
+        }
+
+        static constexpr char kShader[] = R"(
+struct VSInput {
+    float2 position : POSITION;
+};
+
+float4 VSMain(VSInput input) : SV_Position {
+    return float4(input.position, 0.0f, 1.0f);
+}
+)";
+
+        HMODULE compilerModule = GetModuleHandleW(L"D3DCompiler_47.dll");
+        auto compile = compilerModule != nullptr
+                           ? reinterpret_cast<pD3DCompile>(GetProcAddress(compilerModule, "D3DCompile"))
+                           : nullptr;
+        if (compile == nullptr) {
+            spdlog::warn("[VR] Hidden-area mask unavailable: D3DCompiler_47.dll is not loaded");
+            return false;
+        }
+
+        ComPtr<ID3DBlob> shader;
+        ComPtr<ID3DBlob> errors;
+        HRESULT hr = compile(kShader, sizeof(kShader) - 1, "vr_visibility_mask", nullptr, nullptr, "VSMain",
+                             "vs_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, shader.GetAddressOf(),
+                             errors.GetAddressOf());
+        if (FAILED(hr)) {
+            const char* error = errors ? static_cast<const char*>(errors->GetBufferPointer()) : "unknown error";
+            spdlog::warn("[VR] Hidden-area mask vertex shader compilation failed: {}", error);
+            return false;
+        }
+
+        hr = mDevice->CreateVertexShader(shader->GetBufferPointer(), shader->GetBufferSize(), nullptr,
+                                         mVisibilityMaskVs.GetAddressOf());
+        if (FAILED(hr)) {
+            spdlog::warn("[VR] Hidden-area mask vertex shader creation failed (0x{:08x})", (uint32_t)hr);
+            return false;
+        }
+        D3D11_INPUT_ELEMENT_DESC element = { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,
+                                             D3D11_INPUT_PER_VERTEX_DATA, 0 };
+        hr = mDevice->CreateInputLayout(&element, 1, shader->GetBufferPointer(), shader->GetBufferSize(),
+                                        mVisibilityMaskInputLayout.GetAddressOf());
+        if (FAILED(hr)) {
+            spdlog::warn("[VR] Hidden-area mask input layout creation failed (0x{:08x})", (uint32_t)hr);
+            return false;
+        }
+
+        D3D11_DEPTH_STENCIL_DESC depth = {};
+        depth.DepthEnable = false;
+        depth.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+        depth.DepthFunc = D3D11_COMPARISON_ALWAYS;
+        depth.StencilEnable = true;
+        depth.StencilReadMask = D3D11_DEFAULT_STENCIL_READ_MASK;
+        depth.StencilWriteMask = D3D11_DEFAULT_STENCIL_WRITE_MASK;
+        depth.FrontFace.StencilFailOp = D3D11_STENCIL_OP_KEEP;
+        depth.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+        depth.FrontFace.StencilPassOp = D3D11_STENCIL_OP_REPLACE;
+        depth.FrontFace.StencilFunc = D3D11_COMPARISON_ALWAYS;
+        depth.BackFace = depth.FrontFace;
+        hr = mDevice->CreateDepthStencilState(&depth, mVisibilityMaskDepthState.GetAddressOf());
+        if (FAILED(hr)) {
+            spdlog::warn("[VR] Hidden-area mask stencil state creation failed (0x{:08x})", (uint32_t)hr);
+            return false;
+        }
+
+        D3D11_RASTERIZER_DESC rasterizer = {};
+        rasterizer.FillMode = D3D11_FILL_SOLID;
+        rasterizer.CullMode = D3D11_CULL_NONE;
+        rasterizer.DepthClipEnable = true;
+        hr = mDevice->CreateRasterizerState(&rasterizer, mVisibilityMaskRasterizerState.GetAddressOf());
+        if (FAILED(hr)) {
+            spdlog::warn("[VR] Hidden-area mask rasterizer state creation failed (0x{:08x})", (uint32_t)hr);
+            return false;
+        }
+        return true;
+    }
+
+    bool HasVisibilityMask(Target t) const {
+        if (!mVisibilityMaskConfigured || mVisibilityMaskEyesForPass == 0 || !mTargets[(int)t].hasStencil) {
+            return false;
+        }
+        if (t == Target::Eye0) {
+            return (mVisibilityMaskEyesForPass & 0x1u) != 0 && mVisibilityMasks[0].indexCount != 0;
+        }
+        if (t == Target::Eye1) {
+            return (mVisibilityMaskEyesForPass & 0x2u) != 0 && mVisibilityMasks[1].indexCount != 0;
+        }
+        if (t == Target::EyeArray) {
+            return ((mVisibilityMaskEyesForPass & 0x1u) != 0 && mVisibilityMasks[0].indexCount != 0) ||
+                   ((mVisibilityMaskEyesForPass & 0x2u) != 0 && mVisibilityMasks[1].indexCount != 0);
+        }
+        return false;
+    }
+
+    bool DrawVisibilityMask(Target t, uint32_t image) {
+        auto& sc = mTargets[(int)t];
+        if (!HasVisibilityMask(t) || image >= sc.dsvs.size() ||
+            (t == Target::EyeArray && image >= sc.eyeDsvs.size())) {
+            return false;
+        }
+
+        mContext->IASetInputLayout(mVisibilityMaskInputLayout.Get());
+        mContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        mContext->VSSetShader(mVisibilityMaskVs.Get(), nullptr, 0);
+        mContext->GSSetShader(nullptr, nullptr, 0);
+        mContext->PSSetShader(nullptr, nullptr, 0);
+        mContext->RSSetState(mVisibilityMaskRasterizerState.Get());
+        mContext->OMSetDepthStencilState(mVisibilityMaskDepthState.Get(), 1);
+
+        auto drawEye = [&](uint32_t eye, ID3D11DepthStencilView* dsv) {
+            const auto& mask = mVisibilityMasks[eye];
+            if ((mVisibilityMaskEyesForPass & (1u << eye)) == 0 || mask.indexCount == 0 || dsv == nullptr) {
+                return;
+            }
+            mContext->OMSetRenderTargets(0, nullptr, dsv);
+            ID3D11Buffer* vertexBuffer = mask.vertexBuffer.Get();
+            const UINT stride = sizeof(float) * 2;
+            const UINT offset = 0;
+            mContext->IASetVertexBuffers(0, 1, &vertexBuffer, &stride, &offset);
+            mContext->IASetIndexBuffer(mask.indexBuffer.Get(), DXGI_FORMAT_R32_UINT, 0);
+            mContext->DrawIndexed(mask.indexCount, 0, 0);
+        };
+
+        if (t == Target::EyeArray) {
+            drawEye(0, sc.eyeDsvs[image][0].Get());
+            drawEye(1, sc.eyeDsvs[image][1].Get());
+        } else {
+            const uint32_t eye = t == Target::Eye1 ? 1u : 0u;
+            drawEye(eye, sc.dsvs[image].Get());
+        }
+
+        ID3D11RenderTargetView* rtv = sc.rtvs[image].Get();
+        mContext->OMSetRenderTargets(1, &rtv, sc.dsvs[image].Get());
+        mDx->InvalidatePipelineStateAfterExternalDraw();
+        return true;
+    }
+
     static std::string AdapterName(const wchar_t* w) {
         const int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
         if (n <= 1) {
@@ -388,10 +662,17 @@ class D3D11Backend final : public Backend {
 
     struct TargetImages {
         uint32_t width = 0, height = 0;
+        bool hasStencil = false;
         std::vector<XrSwapchainImageD3D11KHR> images;
         std::vector<ComPtr<ID3D11RenderTargetView>> rtvs;
         std::vector<ComPtr<ID3D11DepthStencilView>> dsvs;
+        std::vector<std::array<ComPtr<ID3D11DepthStencilView>, 2>> eyeDsvs;
         std::vector<ComPtr<ID3D11Texture2D>> depth;
+    };
+    struct VisibilityMask {
+        ComPtr<ID3D11Buffer> vertexBuffer;
+        ComPtr<ID3D11Buffer> indexBuffer;
+        uint32_t indexCount = 0;
     };
     struct MirrorCopy {
         ComPtr<ID3D11Texture2D> tex;
@@ -407,6 +688,13 @@ class D3D11Backend final : public Backend {
     DXGI_FORMAT mViewFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
     TargetImages mTargets[(int)Target::Count];
     MirrorCopy mMirror[kMirrorCount];
+    bool mVisibilityMaskConfigured = false;
+    uint32_t mVisibilityMaskEyesForPass = 0x3u;
+    std::array<VisibilityMask, 2> mVisibilityMasks;
+    ComPtr<ID3D11VertexShader> mVisibilityMaskVs;
+    ComPtr<ID3D11InputLayout> mVisibilityMaskInputLayout;
+    ComPtr<ID3D11DepthStencilState> mVisibilityMaskDepthState;
+    ComPtr<ID3D11RasterizerState> mVisibilityMaskRasterizerState;
 };
 
 } // namespace

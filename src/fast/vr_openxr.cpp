@@ -167,6 +167,19 @@ static struct {
     uint32_t mv_gen;     // bumped whenever the matrices the renderer should use change
     float mv_eye_mtx[2][16];
 
+    // Runtime-provided lens masks. OpenXR supplies vertices in each eye's z=-1 view plane; after
+    // xrLocateViews gives us that eye's current FOV, they are projected to clip-space XY and sent
+    // to the graphics leaf. The D3D11 leaf stamps hidden pixels into stencil before scene draws.
+    struct VisibilityMask {
+        std::vector<XrVector2f> vertices;
+        std::vector<uint32_t> indices;
+        std::vector<float> clip_xy;
+        XrFovf uploaded_fov;
+        bool dirty;
+        bool has_uploaded_fov;
+    } visibility_masks[2];
+    bool visibility_mask_configured;
+
     // Configuration
     float world_scale;       // N64 units per meter
     float near_clip;         // In game units
@@ -367,6 +380,12 @@ static struct {
     // unavailable the feature is inert: user_present stays true and doffing changes nothing.
     bool user_presence_supported;
     bool user_present;
+
+    // XR_KHR_visibility_mask is enabled only when requested before instance creation. The function
+    // pointer belongs to that instance and is cleared when the instance is destroyed.
+    bool visibility_mask_supported;
+    bool visibility_mask_extension_enabled;
+    PFN_xrGetVisibilityMaskKHR get_visibility_mask;
 
     // Alyx-style in-wall view fade: when the player's physical head is inside geometry, the WORLD
     // layer fades toward black at the compositor (XR_KHR_composition_layer_color_scale_bias) —
@@ -785,6 +804,150 @@ static glm::vec3 vr_anchor_now() {
     return base;
 }
 
+static void vr_clear_visibility_mask(uint32_t eye) {
+    if (eye >= 2) {
+        return;
+    }
+    auto& mask = xr.visibility_masks[eye];
+    mask.vertices.clear();
+    mask.indices.clear();
+    mask.clip_xy.clear();
+    mask.dirty = true;
+    mask.has_uploaded_fov = false;
+}
+
+// XR_KHR_visibility_mask uses the two-call idiom for two arrays in one structure. Any malformed or
+// failed update disables that eye's mask: rendering extra pixels is always safer than hiding pixels
+// the player might be able to see.
+static bool vr_query_visibility_mask(uint32_t eye) {
+    if (eye >= 2 || !xr.visibility_mask_extension_enabled || xr.get_visibility_mask == nullptr ||
+        xr.session == XR_NULL_HANDLE) {
+        return false;
+    }
+
+    XrVisibilityMaskKHR sizes = { XR_TYPE_VISIBILITY_MASK_KHR };
+    XrResult result = xr.get_visibility_mask(xr.session, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, eye,
+                                             XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR, &sizes);
+    if (XR_FAILED(result)) {
+        xr_check(result, "xrGetVisibilityMaskKHR (sizes)");
+        vr_clear_visibility_mask(eye);
+        return false;
+    }
+    if (sizes.vertexCountOutput == 0 || sizes.indexCountOutput == 0) {
+        vr_clear_visibility_mask(eye);
+        spdlog::info("[VR] Hidden-area mask: runtime supplied no mesh for eye {}", eye);
+        return false;
+    }
+
+    auto& mask = xr.visibility_masks[eye];
+    mask.vertices.resize(sizes.vertexCountOutput);
+    mask.indices.resize(sizes.indexCountOutput);
+
+    bool fetched = false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        XrVisibilityMaskKHR data = { XR_TYPE_VISIBILITY_MASK_KHR };
+        data.vertexCapacityInput = (uint32_t)mask.vertices.size();
+        data.vertices = mask.vertices.data();
+        data.indexCapacityInput = (uint32_t)mask.indices.size();
+        data.indices = mask.indices.data();
+        result = xr.get_visibility_mask(xr.session, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, eye,
+                                        XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR, &data);
+        if (result == XR_ERROR_SIZE_INSUFFICIENT) {
+            if (data.vertexCountOutput == 0 || data.indexCountOutput == 0) {
+                break;
+            }
+            mask.vertices.resize(data.vertexCountOutput);
+            mask.indices.resize(data.indexCountOutput);
+            continue;
+        }
+        if (XR_FAILED(result)) {
+            xr_check(result, "xrGetVisibilityMaskKHR (mesh)");
+            break;
+        }
+        if (data.vertexCountOutput > mask.vertices.size() || data.indexCountOutput > mask.indices.size()) {
+            break;
+        }
+        mask.vertices.resize(data.vertexCountOutput);
+        mask.indices.resize(data.indexCountOutput);
+        fetched = true;
+        break;
+    }
+
+    if (!fetched || mask.vertices.empty() || mask.indices.empty() || mask.indices.size() % 3 != 0) {
+        spdlog::warn("[VR] Hidden-area mask eye {} was unavailable or malformed; rendering the full eye", eye);
+        vr_clear_visibility_mask(eye);
+        return false;
+    }
+    for (uint32_t index : mask.indices) {
+        if (index >= mask.vertices.size()) {
+            spdlog::warn("[VR] Hidden-area mask eye {} contains an invalid vertex index; rendering the full eye", eye);
+            vr_clear_visibility_mask(eye);
+            return false;
+        }
+    }
+
+    mask.clip_xy.resize(mask.vertices.size() * 2);
+    mask.dirty = true;
+    spdlog::info("[VR] Hidden-area mask eye {}: {} vertices, {} triangles", eye, mask.vertices.size(),
+                 mask.indices.size() / 3);
+    return true;
+}
+
+static bool vr_same_fov(const XrFovf& a, const XrFovf& b) {
+    return a.angleLeft == b.angleLeft && a.angleRight == b.angleRight && a.angleUp == b.angleUp &&
+           a.angleDown == b.angleDown;
+}
+
+static void vr_update_visibility_masks() {
+    if (!xr.visibility_mask_configured || !xr.gfx) {
+        return;
+    }
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        auto& mask = xr.visibility_masks[eye];
+        const XrFovf& fov = xr.views[eye].fov;
+        if (!mask.dirty && mask.has_uploaded_fov && vr_same_fov(mask.uploaded_fov, fov)) {
+            continue;
+        }
+        if (mask.vertices.empty() || mask.indices.empty()) {
+            xr.gfx->SetVisibilityMask(eye, nullptr, 0, nullptr, 0);
+            mask.dirty = false;
+            mask.uploaded_fov = fov;
+            mask.has_uploaded_fov = true;
+            continue;
+        }
+
+        const float(&projection)[4][4] = xr.projection[eye];
+        bool valid = true;
+        for (size_t i = 0; i < mask.vertices.size(); ++i) {
+            const float x = mask.vertices[i].x;
+            const float y = mask.vertices[i].y;
+            // OpenXR defines mask vertices on view-space z=-1 with w=1. The engine stores a
+            // row-vector projection, so clip = (x, y, -1, 1) * projection.
+            const float clipX = x * projection[0][0] + y * projection[1][0] - projection[2][0] + projection[3][0];
+            const float clipY = x * projection[0][1] + y * projection[1][1] - projection[2][1] + projection[3][1];
+            const float clipW = x * projection[0][3] + y * projection[1][3] - projection[2][3] + projection[3][3];
+            if (!std::isfinite(clipX) || !std::isfinite(clipY) || !std::isfinite(clipW) ||
+                std::fabs(clipW) < 1e-6f) {
+                valid = false;
+                break;
+            }
+            mask.clip_xy[i * 2 + 0] = clipX / clipW;
+            mask.clip_xy[i * 2 + 1] = clipY / clipW;
+        }
+
+        if (valid) {
+            xr.gfx->SetVisibilityMask(eye, mask.clip_xy.data(), (uint32_t)mask.vertices.size(), mask.indices.data(),
+                                      (uint32_t)mask.indices.size());
+        } else {
+            spdlog::warn("[VR] Hidden-area mask eye {} projection was invalid; rendering the full eye", eye);
+            xr.gfx->SetVisibilityMask(eye, nullptr, 0, nullptr, 0);
+        }
+        mask.dirty = false;
+        mask.uploaded_fov = fov;
+        mask.has_uploaded_fov = true;
+    }
+}
+
 static void poll_events() {
     XrEventDataBuffer event = { XR_TYPE_EVENT_DATA_BUFFER };
     while (xrPollEvent(xr.instance, &event) == XR_SUCCESS) {
@@ -804,6 +967,14 @@ static void poll_events() {
             } else {
                 spdlog::info("[VR] Runtime reports the headset not worn before ever reporting it worn; "
                              "staying in VR (proximity sensor may be disabled or not forwarded)");
+            }
+        } else if (event.type == XR_TYPE_EVENT_DATA_VISIBILITY_MASK_CHANGED_KHR) {
+            auto* maskEvent = reinterpret_cast<XrEventDataVisibilityMaskChangedKHR*>(&event);
+            if (xr.visibility_mask_configured && maskEvent->session == xr.session &&
+                maskEvent->viewConfigurationType == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO &&
+                maskEvent->viewIndex < 2) {
+                spdlog::info("[VR] Runtime changed hidden-area mask for eye {}", maskEvent->viewIndex);
+                vr_query_visibility_mask(maskEvent->viewIndex);
             }
         } else if (event.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
             spdlog::warn("[VR] OpenXR instance loss pending (runtime shutting down or restarting)");
@@ -1822,6 +1993,9 @@ static bool vr_create_instance(const char* required_ext, const char* api_name, c
     xr.color_scale_supported = false;
     xr.perf_settings_supported = false;
     xr.refresh_rate_supported = false;
+    xr.visibility_mask_supported = false;
+    xr.visibility_mask_extension_enabled = false;
+    xr.get_visibility_mask = nullptr;
     {
         bool required_offered = false;
         uint32_t ext_count = 0;
@@ -1840,6 +2014,9 @@ static bool vr_create_instance(const char* required_ext, const char* api_name, c
             }
             if (strcmp(p.extensionName, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME) == 0) {
                 xr.refresh_rate_supported = true;
+            }
+            if (strcmp(p.extensionName, XR_KHR_VISIBILITY_MASK_EXTENSION_NAME) == 0) {
+                xr.visibility_mask_supported = true;
             }
             if (strcmp(p.extensionName, required_ext) == 0) {
                 required_offered = true;
@@ -1866,6 +2043,10 @@ static bool vr_create_instance(const char* required_ext, const char* api_name, c
     if (xr.refresh_rate_supported) {
         extensions.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
     }
+    if (xr.visibility_mask_supported && CVarGetInteger("gVrHiddenAreaMask", 0) != 0) {
+        extensions.push_back(XR_KHR_VISIBILITY_MASK_EXTENSION_NAME);
+        xr.visibility_mask_extension_enabled = true;
+    }
 #ifdef __ANDROID__
     extensions.push_back(XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME);
 #endif
@@ -1891,6 +2072,18 @@ static bool vr_create_instance(const char* required_ext, const char* api_name, c
         return false;
     }
     vr_log_instance_properties();
+
+    if (xr.visibility_mask_extension_enabled) {
+        const XrResult procResult =
+            xrGetInstanceProcAddr(xr.instance, "xrGetVisibilityMaskKHR",
+                                  reinterpret_cast<PFN_xrVoidFunction*>(&xr.get_visibility_mask));
+        if (XR_FAILED(procResult) || xr.get_visibility_mask == nullptr) {
+            spdlog::warn("[VR] XR_KHR_visibility_mask was enabled but xrGetVisibilityMaskKHR is unavailable; "
+                         "rendering complete eye images");
+            xr.visibility_mask_extension_enabled = false;
+            xr.get_visibility_mask = nullptr;
+        }
+    }
     return true;
 }
 
@@ -2077,6 +2270,32 @@ static bool vr_session_init() {
                  xr.config_views[0].recommendedImageRectWidth,
                  xr.config_views[0].recommendedImageRectHeight);
 
+    // Query the runtime mesh before eye targets are attached: the backend can then select a
+    // stencil-capable depth format only when a real mask is available. Failure is deliberately a
+    // full-eye fallback, never a session failure.
+    xr.visibility_mask_configured = false;
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        vr_clear_visibility_mask(eye);
+    }
+    xr.gfx->ConfigureVisibilityMask(false);
+    const bool visibilityMaskRequested = CVarGetInteger("gVrHiddenAreaMask", 0) != 0;
+    if (visibilityMaskRequested && xr.visibility_mask_extension_enabled) {
+        bool anyMask = false;
+        for (uint32_t eye = 0; eye < 2; ++eye) {
+            anyMask |= vr_query_visibility_mask(eye);
+        }
+        if (anyMask && xr.gfx->ConfigureVisibilityMask(true)) {
+            xr.visibility_mask_configured = true;
+            spdlog::info("[VR] Hidden-area mask enabled; lens-hidden pixels will be rejected with stencil");
+        } else if (anyMask) {
+            spdlog::info("[VR] Hidden-area mask unavailable on the active graphics backend; rendering full eyes");
+        } else {
+            spdlog::info("[VR] Hidden-area mask unavailable: the runtime supplied no valid hidden mesh");
+        }
+    } else if (visibilityMaskRequested) {
+        spdlog::info("[VR] Hidden-area mask unavailable: the OpenXR runtime does not support it");
+    }
+
     // --- Enumerate Swapchain Formats ---
     uint32_t format_count = 0;
     xrEnumerateSwapchainFormats(xr.session, 0, &format_count, nullptr);
@@ -2214,6 +2433,10 @@ void vr_shutdown() {
     xr.eyes_ever_rendered = false;
     xr.multiview = false;
     xr.multiview_pass = false;
+    xr.visibility_mask_configured = false;
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        vr_clear_visibility_mask(eye);
+    }
     xr.flat_screen = false;
     xr.flat_screen_prev = false;
 
@@ -2240,6 +2463,9 @@ void vr_shutdown() {
         xrDestroyInstance(xr.instance);
         xr.instance = XR_NULL_HANDLE;
     }
+    xr.visibility_mask_extension_enabled = false;
+    xr.visibility_mask_supported = false;
+    xr.get_visibility_mask = nullptr;
 
     spdlog::info("[VR] OpenXR shut down");
 }
@@ -2816,6 +3042,7 @@ bool vr_begin_frame() {
         build_projection_matrix(xr.views[eye].fov, xr.near_clip, xr.far_clip, xr.projection[eye]);
         pose_to_view_matrix(xr.views[eye].pose, xr.world_scale, xr.view[eye]);
     }
+    vr_update_visibility_masks();
     vr_build_center_view();
 
     return true;
@@ -3546,6 +3773,11 @@ void vr_begin_eye(int eye) {
     wait_info.timeout = XR_INFINITE_DURATION;
     xr_check(xrWaitSwapchainImage(sc.handle, &wait_info), "xrWaitSwapchainImage");
 
+    // The desktop companion copies the left eye. Render that eye completely on companion-update
+    // frames so the monitor never exposes the lens-hidden cutout; headset-only frames retain the
+    // visibility-mask saving. The right eye remains masked in two-pass mode.
+    xr.gfx->SetVisibilityMaskEyesForPass((eye == 0 && xr.plan_present_desktop) ? 0u : (1u << eye));
+
     // Bind, clear (opaque black, depth 1.0), full viewport, renderer told the target size.
     const float clear_color[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
     xr.gfx->BeginPass(vr_eye_target(eye), image_index, clear_color);
@@ -3577,6 +3809,10 @@ bool vr_multiview_enabled() {
     return xr.initialized && xr.multiview;
 }
 
+bool vr_visibility_mask_enabled() {
+    return xr.initialized && xr.gfx && xr.gfx->VisibilityMaskActive();
+}
+
 void vr_begin_stereo() {
     if (!xr.initialized || !xr.multiview) return;
     xr.current_eye = kCenterEye;
@@ -3594,6 +3830,10 @@ void vr_begin_stereo() {
     XrSwapchainImageWaitInfo wait_info = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
     wait_info.timeout = XR_INFINITE_DURATION;
     xr_check(xrWaitSwapchainImage(sc.handle, &wait_info), "xrWaitSwapchainImage");
+
+    // Both layers share one draw pass but have independent stencil slices. Leave the mirrored left
+    // layer complete while retaining the right-eye mask; headset-only frames mask both eyes.
+    xr.gfx->SetVisibilityMaskEyesForPass(xr.plan_present_desktop ? 0x2u : 0x3u);
 
     const float clear_color[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
     xr.gfx->BeginPass(vrgfx::Target::EyeArray, image_index, clear_color);
@@ -3854,6 +4094,10 @@ bool vr_is_initialized() {
     // The mod-wide predicate: every VR hook in the game and interpreter gates on this, so the
     // enabled flag toggles the entire mod as one unit.
     return xr.initialized && xr.enabled;
+}
+
+bool vr_is_session_focused() {
+    return xr.initialized && xr.enabled && xr.session_running && xr.session_state == XR_SESSION_STATE_FOCUSED;
 }
 
 // vr_init retry window (vr_apply_mode_request): a headset that isn't available yet, or a session
@@ -5361,6 +5605,7 @@ void vr_get_frame_stats(struct VrFrameStats* out) {
 void vr_begin_eye(int) {}
 void vr_end_eye(int) {}
 bool vr_multiview_enabled() { return false; }
+bool vr_visibility_mask_enabled() { return false; }
 void vr_begin_stereo() {}
 void vr_end_stereo() {}
 bool vr_is_multiview_pass() { return false; }
@@ -5378,6 +5623,7 @@ void vr_get_projection_matrix(int, float out[4][4]) { memset(out, 0, sizeof(floa
 void vr_get_fog_ndc_z_params(float* a, float* b) { *a = *b = 0.0f; }
 void vr_get_view_matrix(int, float out[4][4]) { memset(out, 0, sizeof(float) * 16); }
 bool vr_is_initialized() { return false; }
+bool vr_is_session_focused() { return false; }
 int vr_get_current_eye() { return 0; }
 void vr_get_recommended_resolution(uint32_t* w, uint32_t* h) { *w = 0; *h = 0; }
 uint32_t vr_get_refresh_rate() { return 90; }
