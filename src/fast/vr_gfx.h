@@ -43,6 +43,7 @@ enum class Target : int { Eye0, Eye1, Hud, Text, Screen, Menu, Beam, EyeArray, C
 
 // Desktop mirror slots: 0 = left eye, 1 = HUD, 2 = text panel, 3 = flat-screen panel.
 enum MirrorSlot : int { kMirrorEye = 0, kMirrorHud = 1, kMirrorText = 2, kMirrorScreen = 3, kMirrorCount = 4 };
+enum class TimingPhase : int { Eyes = 0, Hud = 1, Desktop = 2, Count = 3 };
 
 struct Rect {
     int32_t x, y, w, h; // pixels, TOP-LEFT origin of the picture
@@ -123,6 +124,12 @@ class Backend {
     virtual bool VisibilityMaskActive() const {
         return false;
     }
+
+    virtual void TimingFrameBegin() {}
+    virtual void TimingPhaseBegin(TimingPhase) {}
+    virtual void TimingPhaseEnd(TimingPhase) {}
+    virtual void TimingFrameEnd() {}
+    virtual bool TimingGetLatest(float*, float*, float*, float*) { return false; }
 
     virtual void Shutdown() = 0;
 };

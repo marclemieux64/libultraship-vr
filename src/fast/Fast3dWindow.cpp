@@ -34,10 +34,15 @@ namespace {
 
 struct VrBenchmarkSample {
     double elapsedSeconds;
+    float waitMs;
     float eyesMs;
     float hudMs;
     float desktopMs;
     float totalMs;
+    float gpuEyesMs;
+    float gpuHudMs;
+    float gpuDesktopMs;
+    float gpuTotalMs;
     bool renderedEyes;
     uint32_t runtimePredictedRefreshRate;
 };
@@ -115,22 +120,40 @@ void FinishVrBenchmark() {
     std::filesystem::create_directories("benchmarks");
     const std::string stem = "benchmarks/" + TimestampForFile() + "_" + benchmark.name;
     std::ofstream csv(stem + ".csv");
-    csv << "frame,elapsed_seconds,rendered_eyes,runtime_predicted_refresh_rate_hz,eyes_ms,hud_ms,desktop_ms,"
-           "total_cpu_ms\n";
+    csv << "frame,elapsed_seconds,rendered_eyes,runtime_predicted_refresh_rate_hz,xr_wait_ms,active_cpu_ms,"
+           "eyes_ms,hud_ms,desktop_ms,total_frame_ms,gpu_eyes_ms,gpu_hud_ms,gpu_desktop_ms,gpu_total_ms\n";
 
     std::vector<float> totalTimes;
+    std::vector<float> activeTimes;
+    std::vector<float> waitTimes;
     std::vector<float> eyesTimes;
+    std::vector<float> gpuEyesTimes;
+    std::vector<float> gpuHudTimes;
+    std::vector<float> gpuDesktopTimes;
+    std::vector<float> gpuTotalTimes;
     std::vector<float> frameIntervals;
     totalTimes.reserve(benchmark.samples.size());
+    activeTimes.reserve(benchmark.samples.size());
+    waitTimes.reserve(benchmark.samples.size());
     eyesTimes.reserve(benchmark.samples.size());
     size_t renderedFrames = 0;
     for (size_t i = 0; i < benchmark.samples.size(); ++i) {
         const auto& sample = benchmark.samples[i];
+        const float activeMs = std::max(0.0f, sample.totalMs - sample.waitMs);
         csv << i << ',' << std::fixed << std::setprecision(6) << sample.elapsedSeconds << ','
-            << (sample.renderedEyes ? 1 : 0) << ',' << sample.runtimePredictedRefreshRate << ',' << sample.eyesMs << ','
-            << sample.hudMs << ','
-            << sample.desktopMs << ',' << sample.totalMs << '\n';
+            << (sample.renderedEyes ? 1 : 0) << ',' << sample.runtimePredictedRefreshRate << ',' << sample.waitMs << ','
+            << activeMs << ',' << sample.eyesMs << ',' << sample.hudMs << ','
+            << sample.desktopMs << ',' << sample.totalMs << ',' << sample.gpuEyesMs << ',' << sample.gpuHudMs << ','
+            << sample.gpuDesktopMs << ',' << sample.gpuTotalMs << '\n';
         totalTimes.push_back(sample.totalMs);
+        activeTimes.push_back(activeMs);
+        waitTimes.push_back(sample.waitMs);
+        if (sample.gpuTotalMs > 0.0f) {
+            gpuEyesTimes.push_back(sample.gpuEyesMs);
+            gpuHudTimes.push_back(sample.gpuHudMs);
+            gpuDesktopTimes.push_back(sample.gpuDesktopMs);
+            gpuTotalTimes.push_back(sample.gpuTotalMs);
+        }
         if (i > 0) {
             frameIntervals.push_back(static_cast<float>((sample.elapsedSeconds - benchmark.samples[i - 1].elapsedSeconds) *
                                                         1000.0));
@@ -218,6 +241,16 @@ void FinishVrBenchmark() {
          << "  \"single_pass_stereo\": " << cvarInt("gVrMultiview", 0) << ",\n"
          << "  \"hidden_area_mask\": " << cvarInt("gVrHiddenAreaMask", 0) << ",\n"
          << "  \"d3d11_state_cache\": " << cvarInt("gVrD3D11StateCache", 1) << ",\n"
+         << "  \"xr_wait_average_ms\": " << Average(waitTimes) << ",\n"
+         << "  \"xr_wait_p99_ms\": " << Percentile(waitTimes, 0.99) << ",\n"
+         << "  \"cpu_active_average_ms\": " << Average(activeTimes) << ",\n"
+         << "  \"cpu_active_p99_ms\": " << Percentile(activeTimes, 0.99) << ",\n"
+         << "  \"gpu_eyes_average_ms\": " << Average(gpuEyesTimes) << ",\n"
+         << "  \"gpu_eyes_p99_ms\": " << Percentile(gpuEyesTimes, 0.99) << ",\n"
+         << "  \"gpu_hud_average_ms\": " << Average(gpuHudTimes) << ",\n"
+         << "  \"gpu_desktop_average_ms\": " << Average(gpuDesktopTimes) << ",\n"
+         << "  \"gpu_total_average_ms\": " << Average(gpuTotalTimes) << ",\n"
+         << "  \"gpu_total_p99_ms\": " << Percentile(gpuTotalTimes, 0.99) << ",\n"
          << "  \"cpu_total_average_ms\": " << Average(totalTimes) << ",\n"
          << "  \"cpu_total_median_ms\": " << Percentile(totalTimes, 0.50) << ",\n"
          << "  \"cpu_total_p99_ms\": " << Percentile(totalTimes, 0.99) << ",\n"
@@ -243,6 +276,10 @@ void FinishVrBenchmark() {
             << (cadenceStable ? "VALID" : "INVALID - reprojection cadence changed") << ")\n"
             << "CPU total: " << Average(totalTimes) << " ms average, " << Percentile(totalTimes, 0.99)
             << " ms P99\n"
+            << "CPU active: " << Average(activeTimes) << " ms average, " << Percentile(activeTimes, 0.99)
+            << " ms P99 (xrWaitFrame excluded)\n"
+            << "XR wait: " << Average(waitTimes) << " ms average\n"
+            << "GPU: " << Average(gpuEyesTimes) << " ms eyes, " << Average(gpuTotalTimes) << " ms total average\n"
             << "CPU eyes: " << Average(eyesTimes) << " ms average, " << Percentile(eyesTimes, 0.99)
             << " ms P99\n";
     std::cout << summary.str() << std::flush;
@@ -650,6 +687,7 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
     float hudMs = 0.0f;
     float desktopMs = 0.0f;
     bool submittedXrFrame = false;
+    bool gpuTimingFrame = false;
 
     // SOH [VR] Stereo path: run the interpreter once per eye into the OpenXR swapchains (or once
     // onto the flat-screen panel for 2D contexts), render the HUD quad, submit the XR frame, then
@@ -659,10 +697,15 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
         // layer so the camera anchor interpolates in lockstep with the interpolated world.
         vr_set_interp_alpha(mInterpreter->mInterpolationT);
         if (vr_begin_frame()) {
+            if (gVrBenchmark.enabled) {
+                vr_gpu_timing_frame_begin();
+                gpuTimingFrame = true;
+            }
             // The divisor covers the flat-screen panel as well as the stereo pair: it is a quad
             // layer at a fixed pose showing a menu, so the compositor resubmits it perfectly and
             // there is even less to lose than with the eyes.
             if (renderEyes) {
+                if (gpuTimingFrame) vr_gpu_timing_phase_begin(0);
                 const auto eyesStart = std::chrono::steady_clock::now();
                 if (vr_get_flat_screen()) {
                     // 2D context (file select, pause): whole frame onto the world-locked panel; the
@@ -683,10 +726,12 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
                     }
                 }
                 eyesMs = elapsedMsSince(eyesStart);
+                if (gpuTimingFrame) vr_gpu_timing_phase_end(0);
             }
 
             // Head-locked HUD overlay (rendered once, not per-eye)
             Gfx* hudCommands = static_cast<Gfx*>(vr_get_hud_commands());
+            if (gpuTimingFrame && renderHud) vr_gpu_timing_phase_begin(1);
             if (hudCommands != nullptr && renderHud) {
                 const auto hudStart = std::chrono::steady_clock::now();
                 vr_begin_hud();
@@ -704,6 +749,7 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
                 vr_end_text();
                 hudMs += elapsedMsSince(textStart);
             }
+            if (gpuTimingFrame && renderHud) vr_gpu_timing_phase_end(1);
 
             vr_end_frame();
             submittedXrFrame = true;
@@ -727,12 +773,14 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
     }
 
     if (presentDesktop) {
+        if (gpuTimingFrame) vr_gpu_timing_phase_begin(2);
         const auto desktopStart = std::chrono::steady_clock::now();
         // Renders the game frame buffer to the final window and finishes the GUI
         gui->EndDraw();
         // Finalize swap buffers
         mInterpreter->EndFrame();
         desktopMs = elapsedMsSince(desktopStart);
+        if (gpuTimingFrame) vr_gpu_timing_phase_end(2);
     } else {
         // Companion window skipped this frame. Still kick the queued GPU work — the XR compositor
         // is the consumer now — but leave the desktop swapchain alone.
@@ -743,6 +791,7 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
     }
 
     if (vr) {
+        if (gpuTimingFrame) vr_gpu_timing_frame_end();
         const float totalMs = elapsedMsSince(frameStart);
         vr_report_frame_times(eyesMs, hudMs, desktopMs, totalMs, renderEyes);
 
@@ -786,8 +835,11 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
             }
             if (gVrBenchmark.measuring) {
                 const double elapsed = std::chrono::duration<double>(now - gVrBenchmark.measureStart).count();
-                gVrBenchmark.samples.push_back(
-                    { elapsed, eyesMs, hudMs, desktopMs, totalMs, renderEyes, vr_get_refresh_rate() });
+                float gpuEyesMs = 0.0f, gpuHudMs = 0.0f, gpuDesktopMs = 0.0f, gpuTotalMs = 0.0f;
+                vr_gpu_timing_get_latest(&gpuEyesMs, &gpuHudMs, &gpuDesktopMs, &gpuTotalMs);
+                gVrBenchmark.samples.push_back({ elapsed, vr_get_last_wait_ms(), eyesMs, hudMs, desktopMs, totalMs,
+                                                 gpuEyesMs, gpuHudMs, gpuDesktopMs, gpuTotalMs, renderEyes,
+                                                 vr_get_refresh_rate() });
                 if (gVrBenchmark.titleIntroEnded || elapsed >= gVrBenchmark.durationSeconds) {
                     FinishVrBenchmark();
                 }

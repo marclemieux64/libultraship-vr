@@ -453,6 +453,60 @@ class D3D11Backend final : public Backend {
         return mDevice != nullptr && mDevice->GetFeatureLevel() >= D3D_FEATURE_LEVEL_10_0;
     }
 
+    void TimingFrameBegin() override {
+        ResolveTimingQueries();
+        mActiveTiming = -1;
+        for (size_t attempt = 0; attempt < mTiming.size(); ++attempt) {
+            mTimingWrite = (mTimingWrite + 1) % mTiming.size();
+            auto& slot = mTiming[mTimingWrite];
+            if (slot.pending) {
+                continue;
+            }
+            if (!EnsureTimingQueries(slot)) {
+                return;
+            }
+            slot.phaseStarted.fill(false);
+            mContext->Begin(slot.disjoint.Get());
+            mContext->End(slot.frameStart.Get());
+            mActiveTiming = static_cast<int>(mTimingWrite);
+            return;
+        }
+    }
+
+    void TimingPhaseBegin(TimingPhase phase) override {
+        if (mActiveTiming < 0) return;
+        const size_t p = static_cast<size_t>(phase);
+        if (p >= static_cast<size_t>(TimingPhase::Count)) return;
+        auto& slot = mTiming[mActiveTiming];
+        mContext->End(slot.phaseStart[p].Get());
+        slot.phaseStarted[p] = true;
+    }
+
+    void TimingPhaseEnd(TimingPhase phase) override {
+        if (mActiveTiming < 0) return;
+        const size_t p = static_cast<size_t>(phase);
+        if (p >= static_cast<size_t>(TimingPhase::Count) || !mTiming[mActiveTiming].phaseStarted[p]) return;
+        mContext->End(mTiming[mActiveTiming].phaseEnd[p].Get());
+    }
+
+    void TimingFrameEnd() override {
+        if (mActiveTiming < 0) return;
+        auto& slot = mTiming[mActiveTiming];
+        mContext->End(slot.frameEnd.Get());
+        mContext->End(slot.disjoint.Get());
+        slot.pending = true;
+        mActiveTiming = -1;
+    }
+
+    bool TimingGetLatest(float* eyes, float* hud, float* desktop, float* total) override {
+        if (!mTimingValid) return false;
+        if (eyes) *eyes = mLatestTiming[0];
+        if (hud) *hud = mLatestTiming[1];
+        if (desktop) *desktop = mLatestTiming[2];
+        if (total) *total = mLatestTiming[3];
+        return true;
+    }
+
     void Shutdown() override {
         for (int t = 0; t < (int)Target::Count; t++) {
             Detach((Target)t);
@@ -470,6 +524,57 @@ class D3D11Backend final : public Backend {
     }
 
   private:
+    struct TimingQueries {
+        ComPtr<ID3D11Query> disjoint;
+        ComPtr<ID3D11Query> frameStart;
+        ComPtr<ID3D11Query> frameEnd;
+        std::array<ComPtr<ID3D11Query>, static_cast<size_t>(TimingPhase::Count)> phaseStart;
+        std::array<ComPtr<ID3D11Query>, static_cast<size_t>(TimingPhase::Count)> phaseEnd;
+        std::array<bool, static_cast<size_t>(TimingPhase::Count)> phaseStarted{};
+        bool pending = false;
+    };
+
+    bool EnsureTimingQueries(TimingQueries& slot) {
+        if (slot.disjoint) return true;
+        D3D11_QUERY_DESC desc = {};
+        desc.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+        if (FAILED(mDevice->CreateQuery(&desc, slot.disjoint.GetAddressOf()))) return false;
+        desc.Query = D3D11_QUERY_TIMESTAMP;
+        if (FAILED(mDevice->CreateQuery(&desc, slot.frameStart.GetAddressOf())) ||
+            FAILED(mDevice->CreateQuery(&desc, slot.frameEnd.GetAddressOf()))) return false;
+        for (size_t p = 0; p < static_cast<size_t>(TimingPhase::Count); ++p) {
+            if (FAILED(mDevice->CreateQuery(&desc, slot.phaseStart[p].GetAddressOf())) ||
+                FAILED(mDevice->CreateQuery(&desc, slot.phaseEnd[p].GetAddressOf()))) return false;
+        }
+        return true;
+    }
+
+    void ResolveTimingQueries() {
+        for (auto& slot : mTiming) {
+            if (!slot.pending) continue;
+            D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint = {};
+            if (mContext->GetData(slot.disjoint.Get(), &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH) !=
+                S_OK) continue;
+            slot.pending = false;
+            if (disjoint.Disjoint || disjoint.Frequency == 0) continue;
+            UINT64 frameStart = 0, frameEnd = 0;
+            if (mContext->GetData(slot.frameStart.Get(), &frameStart, sizeof(frameStart), 0) != S_OK ||
+                mContext->GetData(slot.frameEnd.Get(), &frameEnd, sizeof(frameEnd), 0) != S_OK) continue;
+            const double toMs = 1000.0 / static_cast<double>(disjoint.Frequency);
+            for (size_t p = 0; p < static_cast<size_t>(TimingPhase::Count); ++p) {
+                mLatestTiming[p] = 0.0f;
+                if (!slot.phaseStarted[p]) continue;
+                UINT64 start = 0, end = 0;
+                if (mContext->GetData(slot.phaseStart[p].Get(), &start, sizeof(start), 0) == S_OK &&
+                    mContext->GetData(slot.phaseEnd[p].Get(), &end, sizeof(end), 0) == S_OK && end >= start) {
+                    mLatestTiming[p] = static_cast<float>((end - start) * toMs);
+                }
+            }
+            mLatestTiming[3] = frameEnd >= frameStart ? static_cast<float>((frameEnd - frameStart) * toMs) : 0.0f;
+            mTimingValid = true;
+        }
+    }
+
     bool CreateVisibilityMaskPipeline() {
         if (mVisibilityMaskVs && mVisibilityMaskInputLayout && mVisibilityMaskDepthState &&
             mVisibilityMaskRasterizerState) {
@@ -695,6 +800,11 @@ float4 VSMain(VSInput input) : SV_Position {
     ComPtr<ID3D11InputLayout> mVisibilityMaskInputLayout;
     ComPtr<ID3D11DepthStencilState> mVisibilityMaskDepthState;
     ComPtr<ID3D11RasterizerState> mVisibilityMaskRasterizerState;
+    std::array<TimingQueries, 8> mTiming;
+    size_t mTimingWrite = 0;
+    int mActiveTiming = -1;
+    std::array<float, 4> mLatestTiming{};
+    bool mTimingValid = false;
 };
 
 } // namespace

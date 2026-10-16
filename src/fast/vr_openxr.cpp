@@ -2501,6 +2501,7 @@ bool vr_should_present_desktop() { return xr.plan_present_desktop; }
 namespace {
 
 VrFrameStats g_stats = {};
+float g_last_wait_ms = 0.0f;
 // Rate counters: count events, convert to Hz once a second so the readout is stable.
 int g_eye_pass_count = 0;
 int g_frame_count = 0;
@@ -2706,7 +2707,9 @@ bool vr_begin_frame() {
     XrFrameWaitInfo wait_info = { XR_TYPE_FRAME_WAIT_INFO };
     const auto wait_start = std::chrono::steady_clock::now();
     const XrResult wait_result = xrWaitFrame(xr.session, &wait_info, &xr.frame_state);
-    smooth(g_stats.wait_ms, std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - wait_start).count());
+    g_last_wait_ms =
+        std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - wait_start).count();
+    smooth(g_stats.wait_ms, g_last_wait_ms);
     if (!xr_check(wait_result, "xrWaitFrame")) {
         return false;
     }
@@ -4266,6 +4269,24 @@ uint32_t vr_get_refresh_rate() {
     return xr.refresh_rate ? xr.refresh_rate : 90;
 }
 
+float vr_get_last_wait_ms() {
+    return g_last_wait_ms;
+}
+
+void vr_gpu_timing_frame_begin() { if (xr.gfx) xr.gfx->TimingFrameBegin(); }
+void vr_gpu_timing_phase_begin(int phase) {
+    if (xr.gfx && phase >= 0 && phase < static_cast<int>(vrgfx::TimingPhase::Count))
+        xr.gfx->TimingPhaseBegin(static_cast<vrgfx::TimingPhase>(phase));
+}
+void vr_gpu_timing_phase_end(int phase) {
+    if (xr.gfx && phase >= 0 && phase < static_cast<int>(vrgfx::TimingPhase::Count))
+        xr.gfx->TimingPhaseEnd(static_cast<vrgfx::TimingPhase>(phase));
+}
+void vr_gpu_timing_frame_end() { if (xr.gfx) xr.gfx->TimingFrameEnd(); }
+bool vr_gpu_timing_get_latest(float* eyes, float* hud, float* desktop, float* total) {
+    return xr.gfx && xr.gfx->TimingGetLatest(eyes, hud, desktop, total);
+}
+
 float vr_get_world_scale() {
     return xr.world_scale;
 }
@@ -5638,6 +5659,12 @@ bool vr_is_session_focused() { return false; }
 int vr_get_current_eye() { return 0; }
 void vr_get_recommended_resolution(uint32_t* w, uint32_t* h) { *w = 0; *h = 0; }
 uint32_t vr_get_refresh_rate() { return 90; }
+float vr_get_last_wait_ms() { return 0.0f; }
+void vr_gpu_timing_frame_begin() {}
+void vr_gpu_timing_phase_begin(int) {}
+void vr_gpu_timing_phase_end(int) {}
+void vr_gpu_timing_frame_end() {}
+bool vr_gpu_timing_get_latest(float*, float*, float*, float*) { return false; }
 float vr_get_world_scale() { return 1.0f; }
 void vr_set_world_scale(float) {}
 void vr_set_link_eye_height(float) {}

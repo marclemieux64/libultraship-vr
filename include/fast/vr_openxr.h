@@ -101,6 +101,14 @@ void vr_get_recommended_resolution(uint32_t* width, uint32_t* height);
 // Headset display refresh rate in Hz (e.g. 72/90/120). Used to pace the game's fixed-timestep
 // logic via the interpolation system. Returns a sane default before the first frame is located.
 uint32_t vr_get_refresh_rate();
+// Time spent blocked in xrWaitFrame for the current frame. This is compositor pacing headroom,
+// not active CPU rendering work.
+float vr_get_last_wait_ms();
+void vr_gpu_timing_frame_begin();
+void vr_gpu_timing_phase_begin(int phase);
+void vr_gpu_timing_phase_end(int phase);
+void vr_gpu_timing_frame_end();
+bool vr_gpu_timing_get_latest(float* eyes_ms, float* hud_ms, float* desktop_ms, float* total_ms);
 // Display refresh rates the headset offers (XR_FB_display_refresh_rate: Meta's runtimes), read at
 // session start; 0 where the runtime doesn't offer a choice. gVrRefreshRate (Hz, 0 = the headset's
 // default) picks one of them.
