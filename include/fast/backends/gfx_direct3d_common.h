@@ -4,8 +4,10 @@
 
 #ifdef __cplusplus
 #include "../interpreter.h"
+#include <array>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include "gfx_rendering_api.h"
 #include "d3d11.h"
 #include "d3dcompiler.h"
@@ -144,10 +146,17 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     D3D_FEATURE_LEVEL mFeatureLevel;
 
     // SOH [VR] The VR layer binds OpenXR swapchain RTVs directly (outside the framebuffer map).
-    // Tell the renderer both the height needed by viewport/scissor Y-flips and whether draws must
-    // use the layered geometry-shader path. Ordinary targets always pass multiview=false.
-    void SetExternalRenderTarget(int32_t height, bool multiview) {
+    // Tell the renderer the height needed by viewport/scissor Y-flips, whether draws must use the
+    // layered geometry-shader path, and whether they must reject stencil-marked pixels hidden by
+    // the headset lenses. Ordinary targets pass multiview=false, visibilityMask=false.
+    void SetExternalRenderTarget(int32_t height, bool multiview, bool visibilityMask = false) {
         mRenderTargetHeight = height;
+        if (mVrVisibilityMaskTarget != visibilityMask) {
+            mVrVisibilityMaskTarget = visibilityMask;
+            // Stencil participation is baked into the depth-stencil state. Force the first draw
+            // after an eye/offscreen target transition to bind the matching cached variant.
+            mBoundDepthStencilStateKey = 0xFFu;
+        }
         if (mMultiviewTarget != multiview) {
             mMultiviewTarget = multiview;
             mVrEyeCbBound = false;
@@ -168,7 +177,20 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
 
     // Kept for callers that only bind an ordinary single-layer target.
     void SetRenderTargetHeight(int32_t height) {
-        SetExternalRenderTarget(height, false);
+        SetExternalRenderTarget(height, false, false);
+    }
+
+    // A VR backend may issue a small native draw before the game's display list (for example, the
+    // OpenXR hidden-area stencil mesh). Mark only the pipeline state it touches as unknown so the
+    // next game draw restores its expected bindings without a destructive ClearState.
+    void InvalidatePipelineStateAfterExternalDraw() {
+        mLastShaderProgram = nullptr;
+        mLastGeometryShader = nullptr;
+        mGeometryShaderStateKnown = false;
+        mVrEyeCbBound = false;
+        mBoundDepthStencilStateKey = 0xFFu;
+        mBoundRasterizerStateKey = ~uint64_t{ 0 };
+        mLastPrimitaveTopology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
     }
 
     // SOH [VR] Which GPU the device is created on, set before Init (Fast3dWindow::Init, only when VR
@@ -189,8 +211,15 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
 
     uint32_t mMsaaNumQualityLevels[D3D11_MAX_MULTISAMPLE_SAMPLE_COUNT];
 
-    Microsoft::WRL::ComPtr<ID3D11RasterizerState> mRasterizerState;
-    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mDepthStencilState;
+    // D3D11 state objects are immutable. Cache the small set of variants instead of asking the
+    // driver to recreate identical objects whenever a VR target or display-list mode changes.
+    std::array<Microsoft::WRL::ComPtr<ID3D11DepthStencilState>, 16> mDepthStencilStateCache;
+    std::unordered_map<uint64_t, Microsoft::WRL::ComPtr<ID3D11RasterizerState>> mRasterizerStateCache;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mUncachedDepthStencilState;
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> mUncachedRasterizerState;
+    uint8_t mBoundDepthStencilStateKey = 0xFFu;
+    uint64_t mBoundRasterizerStateKey = ~uint64_t{ 0 };
+    bool mStateObjectCacheEnabled = false;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mVertexBuffer;
     // Ring-allocation cursor into mVertexBuffer, in bytes. Each DrawTriangles appends at the cursor
     // with MAP_WRITE_NO_OVERWRITE and only pays for a buffer rename (MAP_WRITE_DISCARD) when the
@@ -242,6 +271,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     ID3D11GeometryShader* mLastGeometryShader = nullptr;
     bool mGeometryShaderStateKnown = true;
     bool mMultiviewTarget = false;
+    bool mVrVisibilityMaskTarget = false;
     bool mVrEyeCbBound = false;
     uint32_t mVrEyeGeneration = UINT32_MAX;
     Microsoft::WRL::ComPtr<ID3D11BlendState> mLastBlendState = nullptr;

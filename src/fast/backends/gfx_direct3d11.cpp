@@ -281,6 +281,7 @@ void GfxRenderingAPIDX11::Init() {
         mLastGeometryShader = nullptr;
         mGeometryShaderStateKnown = true; // ClearState guarantees a null geometry stage.
         mMultiviewTarget = false;
+        mVrVisibilityMaskTarget = false;
         mVrEyeCbBound = false;
         mVrEyeGeneration = UINT32_MAX;
         mLastBlendState.Reset();
@@ -288,9 +289,8 @@ void GfxRenderingAPIDX11::Init() {
             mLastResourceViews[i].Reset();
             mLastSamplerStates[i].Reset();
         }
-        mLastDepthTest = -1;
-        mLastDepthMask = -1;
-        mLastZmodeDecal = -1;
+        mBoundDepthStencilStateKey = 0xFFu;
+        mBoundRasterizerStateKey = ~uint64_t{ 0 };
         mLastPrimitaveTopology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
     });
 
@@ -834,66 +834,116 @@ void GfxRenderingAPIDX11::SetUseAlpha(bool use_alpha) {
 }
 
 void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
-
-    if (mLastDepthTest != mCurrentDepthTest || mLastDepthMask != mCurrentDepthMask) {
-        mLastDepthTest = mCurrentDepthTest;
-        mLastDepthMask = mCurrentDepthMask;
-
-        mDepthStencilState.Reset();
-
-        D3D11_DEPTH_STENCIL_DESC depth_stencil_desc;
-        ZeroMemory(&depth_stencil_desc, sizeof(D3D11_DEPTH_STENCIL_DESC));
-
-        depth_stencil_desc.DepthEnable = mCurrentDepthTest || mCurrentDepthMask;
-        depth_stencil_desc.DepthWriteMask =
-            mCurrentDepthMask ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
-        depth_stencil_desc.DepthFunc = mCurrentDepthTest
-                                           ? (mCurrentZmodeDecal ? D3D11_COMPARISON_LESS_EQUAL : D3D11_COMPARISON_LESS)
-                                           : D3D11_COMPARISON_ALWAYS;
-        depth_stencil_desc.StencilEnable = false;
-
-        ThrowIfFailed(mDevice->CreateDepthStencilState(&depth_stencil_desc, mDepthStencilState.GetAddressOf()));
-        mContext->OMSetDepthStencilState(mDepthStencilState.Get(), 0);
+    const bool stateObjectCacheEnabled =
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gVrD3D11StateCache", 1) != 0;
+    if (mStateObjectCacheEnabled != stateObjectCacheEnabled) {
+        mStateObjectCacheEnabled = stateObjectCacheEnabled;
+        mBoundDepthStencilStateKey = 0xFFu;
+        mBoundRasterizerStateKey = ~uint64_t{ 0 };
+        mUncachedDepthStencilState.Reset();
+        mUncachedRasterizerState.Reset();
     }
 
-    if (mLastZmodeDecal != mCurrentZmodeDecal) {
-        mLastZmodeDecal = mCurrentZmodeDecal;
-
-        mRasterizerState.Reset();
-
-        D3D11_RASTERIZER_DESC rasterizer_desc;
-        ZeroMemory(&rasterizer_desc, sizeof(D3D11_RASTERIZER_DESC));
-
-        rasterizer_desc.FillMode = D3D11_FILL_SOLID;
-        rasterizer_desc.CullMode = D3D11_CULL_NONE;
-        rasterizer_desc.FrontCounterClockwise = true;
-        rasterizer_desc.DepthBias = 0;
-        // SSDB = SlopeScaledDepthBias 120 leads to -2 at 240p which is the same as N64 mode which has very little
-        // fighting
-        const int n64modeFactor = 120;
-        const int noVanishFactor = 100;
-        float SSDB = -2;
-
-        switch (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_Z_FIGHTING_MODE, 0)) {
-            case 1: // scaled z-fighting (N64 mode like)
-                SSDB = -1.0f * (float)mRenderTargetHeight / n64modeFactor;
-                break;
-            case 2: // no vanishing paths
-                SSDB = -1.0f * (float)mRenderTargetHeight / noVanishFactor;
-                break;
-            case 0: // disabled
-            default:
-                SSDB = -2;
+    // Depth/stencil has only four independent booleans. Normalize decal when depth testing is off
+    // because it cannot affect DepthFunc, producing at most 16 immutable cached objects.
+    const uint8_t depthStencilKey = (mCurrentDepthTest ? 0x1u : 0u) | (mCurrentDepthMask ? 0x2u : 0u) |
+                                    (mCurrentDepthTest && mCurrentZmodeDecal ? 0x4u : 0u) |
+                                    (mVrVisibilityMaskTarget ? 0x8u : 0u);
+    if (mBoundDepthStencilStateKey != depthStencilKey) {
+        auto& state = stateObjectCacheEnabled ? mDepthStencilStateCache[depthStencilKey] : mUncachedDepthStencilState;
+        if (!stateObjectCacheEnabled) {
+            state.Reset();
         }
-        rasterizer_desc.SlopeScaledDepthBias = mCurrentZmodeDecal ? SSDB : 0.0f;
-        rasterizer_desc.DepthBiasClamp = 0.0f;
-        rasterizer_desc.DepthClipEnable = false;
-        rasterizer_desc.ScissorEnable = true;
-        rasterizer_desc.MultisampleEnable = false;
-        rasterizer_desc.AntialiasedLineEnable = false;
+        if (!state) {
+            D3D11_DEPTH_STENCIL_DESC depth_stencil_desc;
+            ZeroMemory(&depth_stencil_desc, sizeof(D3D11_DEPTH_STENCIL_DESC));
 
-        ThrowIfFailed(mDevice->CreateRasterizerState(&rasterizer_desc, mRasterizerState.GetAddressOf()));
-        mContext->RSSetState(mRasterizerState.Get());
+            depth_stencil_desc.DepthEnable = mCurrentDepthTest || mCurrentDepthMask;
+            depth_stencil_desc.DepthWriteMask =
+                mCurrentDepthMask ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
+            depth_stencil_desc.DepthFunc =
+                mCurrentDepthTest
+                    ? (mCurrentZmodeDecal ? D3D11_COMPARISON_LESS_EQUAL : D3D11_COMPARISON_LESS)
+                    : D3D11_COMPARISON_ALWAYS;
+            depth_stencil_desc.StencilEnable = mVrVisibilityMaskTarget;
+            if (mVrVisibilityMaskTarget) {
+                depth_stencil_desc.StencilReadMask = D3D11_DEFAULT_STENCIL_READ_MASK;
+                depth_stencil_desc.StencilWriteMask = 0;
+                depth_stencil_desc.FrontFace.StencilFailOp = D3D11_STENCIL_OP_KEEP;
+                depth_stencil_desc.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+                depth_stencil_desc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_KEEP;
+                depth_stencil_desc.FrontFace.StencilFunc = D3D11_COMPARISON_EQUAL;
+                depth_stencil_desc.BackFace = depth_stencil_desc.FrontFace;
+            }
+
+            ThrowIfFailed(mDevice->CreateDepthStencilState(&depth_stencil_desc, state.GetAddressOf()));
+        }
+        mContext->OMSetDepthStencilState(state.Get(), 0);
+        mBoundDepthStencilStateKey = depthStencilKey;
+    }
+
+    // Slope bias varies only for decal draws, by the selected z-fighting mode and target height.
+    // Those values form a stable key, so eye/HUD/framebuffer transitions reuse their prior state.
+    uint32_t zFightingMode = 0;
+    if (mCurrentZmodeDecal) {
+        const int configuredMode =
+            Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_Z_FIGHTING_MODE, 0);
+        zFightingMode = configuredMode == 1 ? 1u : (configuredMode == 2 ? 2u : 0u);
+    }
+    const uint32_t biasHeight = mCurrentZmodeDecal && zFightingMode != 0 ? static_cast<uint32_t>(mRenderTargetHeight)
+                                                                        : 0u;
+    const uint64_t rasterizerKey = (mCurrentZmodeDecal ? 0x1ull : 0ull) | (uint64_t{ zFightingMode } << 1) |
+                                   (uint64_t{ biasHeight } << 3);
+    if (mBoundRasterizerStateKey != rasterizerKey) {
+        // Target height is part of the bias calculation, so repeated resizes could otherwise retain
+        // an unbounded number of immutable states. The context owns a reference to the currently
+        // bound state, making it safe to discard old cache entries before binding the replacement.
+        constexpr size_t kMaxRasterizerStateCacheSize = 32;
+        if (stateObjectCacheEnabled && !mRasterizerStateCache.contains(rasterizerKey) &&
+            mRasterizerStateCache.size() >= kMaxRasterizerStateCacheSize) {
+            mRasterizerStateCache.clear();
+            mBoundRasterizerStateKey = ~uint64_t{ 0 };
+        }
+        auto& state = stateObjectCacheEnabled ? mRasterizerStateCache[rasterizerKey] : mUncachedRasterizerState;
+        if (!stateObjectCacheEnabled) {
+            state.Reset();
+        }
+        if (!state) {
+            D3D11_RASTERIZER_DESC rasterizer_desc;
+            ZeroMemory(&rasterizer_desc, sizeof(D3D11_RASTERIZER_DESC));
+
+            rasterizer_desc.FillMode = D3D11_FILL_SOLID;
+            rasterizer_desc.CullMode = D3D11_CULL_NONE;
+            rasterizer_desc.FrontCounterClockwise = true;
+            rasterizer_desc.DepthBias = 0;
+            // SSDB = SlopeScaledDepthBias 120 leads to -2 at 240p which is the same as N64 mode which has very little
+            // fighting
+            const int n64modeFactor = 120;
+            const int noVanishFactor = 100;
+            float SSDB = -2;
+
+            switch (zFightingMode) {
+                case 1: // scaled z-fighting (N64 mode like)
+                    SSDB = -1.0f * (float)mRenderTargetHeight / n64modeFactor;
+                    break;
+                case 2: // no vanishing paths
+                    SSDB = -1.0f * (float)mRenderTargetHeight / noVanishFactor;
+                    break;
+                case 0: // disabled
+                default:
+                    SSDB = -2;
+            }
+            rasterizer_desc.SlopeScaledDepthBias = mCurrentZmodeDecal ? SSDB : 0.0f;
+            rasterizer_desc.DepthBiasClamp = 0.0f;
+            rasterizer_desc.DepthClipEnable = false;
+            rasterizer_desc.ScissorEnable = true;
+            rasterizer_desc.MultisampleEnable = false;
+            rasterizer_desc.AntialiasedLineEnable = false;
+
+            ThrowIfFailed(mDevice->CreateRasterizerState(&rasterizer_desc, state.GetAddressOf()));
+        }
+        mContext->RSSetState(state.Get());
+        mBoundRasterizerStateKey = rasterizerKey;
     }
 
     bool textures_changed = false;
