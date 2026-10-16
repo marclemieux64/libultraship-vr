@@ -2470,6 +2470,16 @@ void vr_shutdown() {
     spdlog::info("[VR] OpenXR shut down");
 }
 
+void vr_shutdown_final() {
+    // Context is a static object, so its window is destroyed while the C++ runtime, renderer and
+    // OpenXR loader are themselves being torn down. Calling either backend virtual functions or
+    // xrDestroy* here uses objects whose lifetime has already ended. The operating system reclaims
+    // every remaining process-owned D3D/OpenXR resource immediately after this destructor.
+    xr.initialized = false;
+    xr.session_running = false;
+    (void)xr.gfx.release();
+}
+
 // --------------------------------------------------------------------------
 // Per-frame
 // --------------------------------------------------------------------------
@@ -5588,6 +5598,7 @@ Fast::Interpreter* vr_get_interpreter() { return nullptr; }
 bool vr_init() { return false; }
 void vr_apply_mode_request() {}
 void vr_shutdown() {}
+void vr_shutdown_final() {}
 bool vr_begin_frame() { return false; }
 void vr_end_frame() {}
 void vr_set_frame_plan(bool, bool, bool) {}

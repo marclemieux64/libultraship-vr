@@ -15,11 +15,351 @@
 
 #include "fast/Fast3dGui.h"
 #include "fast/vr_openxr.h"
+#include "fast/vr_benchmark.h"
 #include "libultraship/bridge/consolevariablebridge.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <numeric>
+#include <sstream>
+#include <vector>
+
+namespace {
+
+struct VrBenchmarkSample {
+    double elapsedSeconds;
+    float eyesMs;
+    float hudMs;
+    float desktopMs;
+    float totalMs;
+    bool renderedEyes;
+    uint32_t runtimePredictedRefreshRate;
+};
+
+struct VrBenchmarkState {
+    bool enabled = false;
+    bool measuring = false;
+    bool finished = false;
+    double warmupSeconds = 0.0;
+    double durationSeconds = 120.0;
+    std::string name = "benchmark";
+    int preset = -1; // -1 unchanged, 0 baseline, 1 optimized
+    bool titleIntroActive = false;
+    bool titleIntroEnded = false;
+    std::chrono::steady_clock::time_point vrReadyTime;
+    std::chrono::steady_clock::time_point measureStart;
+    std::chrono::steady_clock::time_point titleIntroDetectedTime;
+    std::vector<VrBenchmarkSample> samples;
+};
+
+VrBenchmarkState gVrBenchmark;
+
+std::string SanitizeBenchmarkName(std::string value) {
+    for (char& c : value) {
+        if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_')) {
+            c = '_';
+        }
+    }
+    return value.empty() ? "benchmark" : value;
+}
+
+double ParsePositiveSeconds(const char* value, double fallback) {
+    if (value == nullptr) {
+        return fallback;
+    }
+    char* end = nullptr;
+    const double parsed = std::strtod(value, &end);
+    return end != value && *end == '\0' && std::isfinite(parsed) && parsed >= 0.0 ? parsed : fallback;
+}
+
+double Percentile(std::vector<float> values, double percentile) {
+    if (values.empty()) {
+        return 0.0;
+    }
+    std::sort(values.begin(), values.end());
+    const double position = percentile * static_cast<double>(values.size() - 1);
+    const size_t lower = static_cast<size_t>(position);
+    const size_t upper = std::min(lower + 1, values.size() - 1);
+    const double fraction = position - static_cast<double>(lower);
+    return values[lower] + (values[upper] - values[lower]) * fraction;
+}
+
+double Average(const std::vector<float>& values) {
+    return values.empty() ? 0.0
+                          : std::accumulate(values.begin(), values.end(), 0.0) / static_cast<double>(values.size());
+}
+
+std::string TimestampForFile() {
+    const std::time_t now = std::time(nullptr);
+    std::tm local{};
+#ifdef _WIN32
+    localtime_s(&local, &now);
+#else
+    localtime_r(&now, &local);
+#endif
+    std::ostringstream result;
+    result << std::put_time(&local, "%Y%m%d-%H%M%S");
+    return result.str();
+}
+
+void FinishVrBenchmark() {
+    auto& benchmark = gVrBenchmark;
+    benchmark.finished = true;
+
+    std::filesystem::create_directories("benchmarks");
+    const std::string stem = "benchmarks/" + TimestampForFile() + "_" + benchmark.name;
+    std::ofstream csv(stem + ".csv");
+    csv << "frame,elapsed_seconds,rendered_eyes,runtime_predicted_refresh_rate_hz,eyes_ms,hud_ms,desktop_ms,"
+           "total_cpu_ms\n";
+
+    std::vector<float> totalTimes;
+    std::vector<float> eyesTimes;
+    std::vector<float> frameIntervals;
+    totalTimes.reserve(benchmark.samples.size());
+    eyesTimes.reserve(benchmark.samples.size());
+    size_t renderedFrames = 0;
+    for (size_t i = 0; i < benchmark.samples.size(); ++i) {
+        const auto& sample = benchmark.samples[i];
+        csv << i << ',' << std::fixed << std::setprecision(6) << sample.elapsedSeconds << ','
+            << (sample.renderedEyes ? 1 : 0) << ',' << sample.runtimePredictedRefreshRate << ',' << sample.eyesMs << ','
+            << sample.hudMs << ','
+            << sample.desktopMs << ',' << sample.totalMs << '\n';
+        totalTimes.push_back(sample.totalMs);
+        if (i > 0) {
+            frameIntervals.push_back(static_cast<float>((sample.elapsedSeconds - benchmark.samples[i - 1].elapsedSeconds) *
+                                                        1000.0));
+        }
+        if (sample.renderedEyes) {
+            renderedFrames++;
+            eyesTimes.push_back(sample.eyesMs);
+        }
+    }
+
+    const auto cvarInt = [](const char* name, int fallback) {
+        return Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(name, fallback);
+    };
+    const auto cvarFloat = [](const char* name, float fallback) {
+        return Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat(name, fallback);
+    };
+    const double measuredDuration = benchmark.samples.empty() ? 0.0 : benchmark.samples.back().elapsedSeconds;
+    const double submittedFps = measuredDuration > 0.0 && benchmark.samples.size() > 1
+                                    ? static_cast<double>(benchmark.samples.size() - 1) / measuredDuration
+                                    : 0.0;
+    const double renderedEyeFps = measuredDuration > 0.0 ? static_cast<double>(renderedFrames) / measuredDuration : 0.0;
+    const double frameIntervalP99 = Percentile(frameIntervals, 0.99);
+    const double onePercentLowFps = frameIntervalP99 > 0.0 ? 1000.0 / frameIntervalP99 : 0.0;
+    const int requestedRefreshRate = cvarInt("gVrRefreshRate", 0);
+    const uint32_t runtimePredictedRefreshRate = vr_get_refresh_rate();
+    const uint32_t cadenceTargetRate = requestedRefreshRate > 0 ? static_cast<uint32_t>(requestedRefreshRate)
+                                                                : runtimePredictedRefreshRate;
+    size_t targetRateFrames = 0;
+    size_t halfRateFrames = 0;
+    size_t refreshRateTransitions = 0;
+    uint32_t previousRuntimeRate = 0;
+    for (const auto& sample : benchmark.samples) {
+        if (sample.runtimePredictedRefreshRate == cadenceTargetRate) {
+            targetRateFrames++;
+        }
+        if (cadenceTargetRate > 0 && sample.runtimePredictedRefreshRate * 2 == cadenceTargetRate) {
+            halfRateFrames++;
+        }
+        if (previousRuntimeRate != 0 && sample.runtimePredictedRefreshRate != previousRuntimeRate) {
+            refreshRateTransitions++;
+        }
+        previousRuntimeRate = sample.runtimePredictedRefreshRate;
+    }
+    const double targetRatePercent = benchmark.samples.empty()
+                                         ? 0.0
+                                         : targetRateFrames * 100.0 / static_cast<double>(benchmark.samples.size());
+    const bool cadenceStable = targetRatePercent >= 95.0;
+    const double expectedRefreshIntervals = measuredDuration * static_cast<double>(cadenceTargetRate);
+    const uint64_t estimatedMissedIntervals = expectedRefreshIntervals > benchmark.samples.size()
+                                                  ? static_cast<uint64_t>(std::llround(expectedRefreshIntervals -
+                                                                                       benchmark.samples.size()))
+                                                  : 0;
+    uint32_t eyeWidth = 0;
+    uint32_t eyeHeight = 0;
+    vr_get_recommended_resolution(&eyeWidth, &eyeHeight);
+
+    std::ofstream json(stem + "-summary.json");
+    json << std::fixed << std::setprecision(3);
+    json << "{\n"
+         << "  \"benchmark\": \"Hyrule Field title introduction\",\n"
+         << "  \"name\": \"" << benchmark.name << "\",\n"
+         << "  \"duration_seconds\": " << measuredDuration << ",\n"
+         << "  \"submitted_frames\": " << benchmark.samples.size() << ",\n"
+         << "  \"rendered_eye_frames\": " << renderedFrames << ",\n"
+         << "  \"eye_width\": " << eyeWidth << ",\n"
+         << "  \"eye_height\": " << eyeHeight << ",\n"
+         << "  \"requested_refresh_rate_hz\": " << requestedRefreshRate << ",\n"
+         << "  \"runtime_predicted_refresh_rate_hz\": " << runtimePredictedRefreshRate << ",\n"
+         << "  \"target_rate_frame_percent\": " << targetRatePercent << ",\n"
+         << "  \"half_rate_reprojection_frames\": " << halfRateFrames << ",\n"
+         << "  \"runtime_rate_transitions\": " << refreshRateTransitions << ",\n"
+         << "  \"cadence_valid\": " << (cadenceStable ? "true" : "false") << ",\n"
+         << "  \"average_submitted_fps\": " << submittedFps << ",\n"
+         << "  \"average_rendered_eye_fps\": " << renderedEyeFps << ",\n"
+         << "  \"refresh_rate_attainment_percent\": "
+         << (cadenceTargetRate > 0 ? submittedFps * 100.0 / cadenceTargetRate : 0.0) << ",\n"
+         << "  \"estimated_missed_refresh_intervals\": " << estimatedMissedIntervals << ",\n"
+         << "  \"one_percent_low_submitted_fps\": " << onePercentLowFps << ",\n"
+         << "  \"frame_interval_average_ms\": " << Average(frameIntervals) << ",\n"
+         << "  \"frame_interval_median_ms\": " << Percentile(frameIntervals, 0.50) << ",\n"
+         << "  \"frame_interval_p99_ms\": " << frameIntervalP99 << ",\n"
+         << "  \"frame_interval_max_ms\": " << Percentile(frameIntervals, 1.0) << ",\n"
+         << "  \"resolution_scale\": " << cvarFloat("gVrResolutionScale", 1.0f) << ",\n"
+         << "  \"stereo_divisor\": " << cvarInt("gVrStereoDivisor", 1) << ",\n"
+         << "  \"single_pass_stereo\": " << cvarInt("gVrMultiview", 0) << ",\n"
+         << "  \"hidden_area_mask\": " << cvarInt("gVrHiddenAreaMask", 0) << ",\n"
+         << "  \"d3d11_state_cache\": " << cvarInt("gVrD3D11StateCache", 1) << ",\n"
+         << "  \"cpu_total_average_ms\": " << Average(totalTimes) << ",\n"
+         << "  \"cpu_total_median_ms\": " << Percentile(totalTimes, 0.50) << ",\n"
+         << "  \"cpu_total_p99_ms\": " << Percentile(totalTimes, 0.99) << ",\n"
+         << "  \"cpu_total_max_ms\": " << Percentile(totalTimes, 1.0) << ",\n"
+         << "  \"cpu_eyes_average_ms\": " << Average(eyesTimes) << ",\n"
+         << "  \"cpu_eyes_p99_ms\": " << Percentile(eyesTimes, 0.99) << "\n"
+         << "}\n";
+
+    // Benchmark mode is a standalone process. Close the result files before
+    // terminating so the game cannot advance another actor frame while its
+    // renderer/window is already shutting down.
+    csv.close();
+    json.close();
+
+    std::ostringstream summary;
+    summary << std::fixed << std::setprecision(3)
+            << "\nVR BENCHMARK COMPLETE\n"
+            << "Output: " << stem << "\n"
+            << "Frames: " << benchmark.samples.size() << " submitted, " << renderedFrames << " eye renders\n"
+            << "Cadence: " << submittedFps << " submitted FPS, " << renderedEyeFps << " rendered-eye FPS, "
+            << onePercentLowFps << " FPS 1% low\n"
+            << "Runtime target-rate frames: " << targetRatePercent << "% ("
+            << (cadenceStable ? "VALID" : "INVALID - reprojection cadence changed") << ")\n"
+            << "CPU total: " << Average(totalTimes) << " ms average, " << Percentile(totalTimes, 0.99)
+            << " ms P99\n"
+            << "CPU eyes: " << Average(eyesTimes) << " ms average, " << Percentile(eyesTimes, 0.99)
+            << " ms P99\n";
+    std::cout << summary.str() << std::flush;
+    SPDLOG_INFO("{}", summary.str());
+    std::error_code removeError;
+    std::filesystem::remove("benchmarks/benchmark-active.txt", removeError);
+
+    std::quick_exit(EXIT_SUCCESS);
+}
+
+} // namespace
+
+extern "C" void vr_benchmark_configure(int argc, char* argv[]) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string argument = argv[i] != nullptr ? argv[i] : "";
+        if (argument == "--vr-benchmark") {
+            gVrBenchmark.enabled = true;
+        } else if (argument == "--benchmark-name" && i + 1 < argc) {
+            gVrBenchmark.name = SanitizeBenchmarkName(argv[++i]);
+        } else if (argument == "--benchmark-warmup" && i + 1 < argc) {
+            gVrBenchmark.warmupSeconds = ParsePositiveSeconds(argv[++i], gVrBenchmark.warmupSeconds);
+        } else if (argument == "--benchmark-duration" && i + 1 < argc) {
+            gVrBenchmark.durationSeconds = ParsePositiveSeconds(argv[++i], gVrBenchmark.durationSeconds);
+        }
+    }
+    if (gVrBenchmark.enabled) {
+        if (gVrBenchmark.name == "baseline") {
+            gVrBenchmark.preset = 0;
+        } else if (gVrBenchmark.name == "optimized") {
+            gVrBenchmark.preset = 1;
+        }
+        std::filesystem::create_directories("benchmarks");
+        std::ofstream marker("benchmarks/benchmark-active.txt");
+        marker << "VR benchmark command line recognized.\n"
+               << "Name: " << gVrBenchmark.name << "\n"
+               << "Warm-up: " << gVrBenchmark.warmupSeconds << " seconds\n"
+               << "Duration: " << gVrBenchmark.durationSeconds << " seconds\n"
+               << "Waiting for OpenXR initialization.\n";
+        std::cout << "\nVR BENCHMARK MODE ENABLED\n"
+                  << "Name: " << gVrBenchmark.name << "\n"
+                  << "Warm-up: " << gVrBenchmark.warmupSeconds << " seconds\n"
+                  << "Measurement: " << gVrBenchmark.durationSeconds << " seconds\n"
+                  << "Waiting for OpenXR initialization...\n\n"
+                  << std::flush;
+    }
+}
+
+extern "C" void vr_benchmark_apply_preset(void) {
+    if (!gVrBenchmark.enabled || gVrBenchmark.preset < 0) {
+        return;
+    }
+    const int enabled = gVrBenchmark.preset;
+    CVarSetInteger("gVrMultiview", enabled);
+    CVarSetInteger("gVrHiddenAreaMask", enabled);
+    CVarSetInteger("gVrD3D11StateCache", enabled);
+    CVarSetInteger("gVrStereoDivisor", 1);
+    CVarSetInteger("gVrDesktopViewDivisor", 16);
+    CVarSetInteger("gVrHudPerTick", 1);
+    CVarSetInteger("gVrStayOnDoff", 1);
+    std::cout << "Benchmark preset applied: " << (enabled ? "optimized" : "baseline") << '\n'
+              << "  Single-Pass Stereo: " << (enabled ? "ON" : "OFF") << '\n'
+              << "  Hidden-Area Mask: " << (enabled ? "ON" : "OFF") << '\n'
+              << "  D3D11 State Cache: " << (enabled ? "ON" : "OFF") << "\n\n"
+              << "  Stereo Render Divisor: 1\n"
+              << "  Companion Window Divisor: 16\n"
+              << "  Draw HUD Once Per Game Tick: ON\n\n"
+              << "  Stay in VR When Headset Is Removed: ON\n\n"
+              << std::flush;
+}
+
+extern "C" int vr_benchmark_is_enabled(void) {
+    return gVrBenchmark.enabled ? 1 : 0;
+}
+
+extern "C" void vr_benchmark_remove_arguments(int* argc, char* argv[]) {
+    if (argc == nullptr || argv == nullptr || *argc <= 1) {
+        return;
+    }
+    int writeIndex = 1;
+    for (int readIndex = 1; readIndex < *argc; ++readIndex) {
+        const std::string argument = argv[readIndex] != nullptr ? argv[readIndex] : "";
+        const bool optionWithValue = argument == "--benchmark-name" || argument == "--benchmark-warmup" ||
+                                     argument == "--benchmark-duration";
+        if (argument == "--vr-benchmark") {
+            continue;
+        }
+        if (optionWithValue) {
+            if (readIndex + 1 < *argc) {
+                ++readIndex;
+            }
+            continue;
+        }
+        argv[writeIndex++] = argv[readIndex];
+    }
+    *argc = writeIndex;
+    argv[writeIndex] = nullptr;
+}
+
+extern "C" void vr_benchmark_title_intro_begin(void) {
+    if (!gVrBenchmark.enabled || gVrBenchmark.finished) {
+        return;
+    }
+    gVrBenchmark.titleIntroActive = true;
+    gVrBenchmark.titleIntroEnded = false;
+    gVrBenchmark.titleIntroDetectedTime = std::chrono::steady_clock::now();
+    gVrBenchmark.measuring = false;
+    gVrBenchmark.vrReadyTime = {};
+    gVrBenchmark.measureStart = {};
+    gVrBenchmark.samples.clear();
+    std::cout << "Hyrule Field title introduction detected; waiting for submitted OpenXR frame.\n" << std::flush;
+}
+
+extern "C" void vr_benchmark_title_intro_end(void) {
+    if (gVrBenchmark.enabled && gVrBenchmark.titleIntroActive && !gVrBenchmark.finished) {
+        gVrBenchmark.titleIntroEnded = true;
+    }
+}
 
 namespace Fast {
 
@@ -56,7 +396,7 @@ Fast3dWindow::Fast3dWindow() : Fast3dWindow(std::vector<std::shared_ptr<Ship::Gu
 
 Fast3dWindow::~Fast3dWindow() {
     SPDLOG_DEBUG("destruct fast3dwindow");
-    vr_shutdown();
+    vr_shutdown_final();
     mInterpreter->Destroy();
     delete mRenderingApi;
     delete mWindowManagerApi;
@@ -309,6 +649,7 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
     float eyesMs = 0.0f;
     float hudMs = 0.0f;
     float desktopMs = 0.0f;
+    bool submittedXrFrame = false;
 
     // SOH [VR] Stereo path: run the interpreter once per eye into the OpenXR swapchains (or once
     // onto the flat-screen panel for 2D contexts), render the HUD quad, submit the XR frame, then
@@ -365,6 +706,7 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
             }
 
             vr_end_frame();
+            submittedXrFrame = true;
         }
 
         if (presentDesktop) {
@@ -401,7 +743,56 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
     }
 
     if (vr) {
-        vr_report_frame_times(eyesMs, hudMs, desktopMs, elapsedMsSince(frameStart), renderEyes);
+        const float totalMs = elapsedMsSince(frameStart);
+        vr_report_frame_times(eyesMs, hudMs, desktopMs, totalMs, renderEyes);
+
+        if (gVrBenchmark.enabled && !gVrBenchmark.finished && gVrBenchmark.titleIntroActive &&
+            !submittedXrFrame) {
+            const double frameWaitSeconds = std::chrono::duration<double>(
+                                                std::chrono::steady_clock::now() -
+                                                gVrBenchmark.titleIntroDetectedTime)
+                                                .count();
+            if (frameWaitSeconds >= 20.0) {
+                std::cout << "VR benchmark aborted: OpenXR submitted no frames within 20 seconds.\n"
+                          << std::flush;
+                gVrBenchmark.finished = true;
+                std::error_code removeError;
+                std::filesystem::remove("benchmarks/benchmark-active.txt", removeError);
+                Close();
+                return true;
+            }
+            if (gVrBenchmark.vrReadyTime.time_since_epoch().count() != 0) {
+                std::cout << "VR benchmark paused because OpenXR stopped submitting frames. Restarting warm-up.\n";
+            }
+            gVrBenchmark.vrReadyTime = {};
+            gVrBenchmark.measureStart = {};
+            gVrBenchmark.measuring = false;
+            gVrBenchmark.samples.clear();
+        } else if (gVrBenchmark.enabled && !gVrBenchmark.finished && gVrBenchmark.titleIntroActive &&
+                   submittedXrFrame) {
+            const auto now = std::chrono::steady_clock::now();
+            if (gVrBenchmark.vrReadyTime.time_since_epoch().count() == 0) {
+                gVrBenchmark.vrReadyTime = now;
+                std::cout << "VR benchmark warm-up started (" << gVrBenchmark.warmupSeconds << " seconds)\n";
+            }
+            const double readySeconds =
+                std::chrono::duration<double>(now - gVrBenchmark.vrReadyTime).count();
+            if (!gVrBenchmark.measuring && readySeconds >= gVrBenchmark.warmupSeconds) {
+                gVrBenchmark.measuring = true;
+                gVrBenchmark.measureStart = now;
+                gVrBenchmark.samples.clear();
+                gVrBenchmark.samples.reserve(static_cast<size_t>(gVrBenchmark.durationSeconds * 200.0));
+                std::cout << "VR benchmark measurement started; recording the complete Hyrule Field introduction.\n";
+            }
+            if (gVrBenchmark.measuring) {
+                const double elapsed = std::chrono::duration<double>(now - gVrBenchmark.measureStart).count();
+                gVrBenchmark.samples.push_back(
+                    { elapsed, eyesMs, hudMs, desktopMs, totalMs, renderEyes, vr_get_refresh_rate() });
+                if (gVrBenchmark.titleIntroEnded || elapsed >= gVrBenchmark.durationSeconds) {
+                    FinishVrBenchmark();
+                }
+            }
+        }
     }
 
     return true;

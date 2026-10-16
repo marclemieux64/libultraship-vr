@@ -22,6 +22,9 @@ bool vr_backend_supported(int window_backend);
 bool vr_probe_required_adapter(int window_backend, uint64_t* luid);
 bool vr_init();
 void vr_shutdown();
+// Final process teardown. Releases graphics resources but leaves the small backend wrapper for the
+// operating system, avoiding heap destruction after the renderer/runtime have begun static exit.
+void vr_shutdown_final();
 // Latch a pending VR<->flat mode request (CVar gVrEnabled). Call ONLY at a game-tick boundary,
 // before the tick's display list is built. Lazily creates the OpenXR session on first enable.
 void vr_apply_mode_request();
