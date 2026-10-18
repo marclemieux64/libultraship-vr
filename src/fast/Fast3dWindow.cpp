@@ -622,6 +622,7 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
     bool renderEyes = true;
     bool renderHud = true;
     bool presentDesktop = true;
+    bool updateDesktopMirror = true;
     if (vr) {
         // Standalone headsets are CPU-bound on the render (October 6 Quest log): redraw every other
         // frame there unless the player chose otherwise. Same default in the menu slider.
@@ -653,21 +654,24 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
         // mInterpolationIndex == 0 marks a tick's first sub-frame (set in soh's RunCommands).
         renderHud = !CVarGetInteger("gVrHudPerTick", 1) || mInterpreter->mInterpolationIndex == 0;
 
-        // The companion window is a courtesy view. Presenting it every XR frame costs an ImGui
-        // frame, a full-eye-resolution mirror blit and a desktop Present, all on the critical path.
-        presentDesktop = (mVrFrameCounter % desktopDivisor) == 0u;
-        // The SoH menu panel's ImGui frame runs every XR frame, and on PC that frame is also the
-        // desktop's (Fast3dGuiVrMenu.cpp), so the desktop presents every frame while it is open.
+        // Keep the desktop swapchain advancing every XR frame. Skipping its entire finalisation
+        // path caused severe frame/audio pacing on DXGI; opening ImGui appeared to fix it because
+        // the interactive menu forced this normal path back on. The divisor now throttles only the
+        // expensive full-eye mirror copy. Between updates the desktop presents the previous copy.
+        updateDesktopMirror = (mVrFrameCounter % desktopDivisor) == 0u;
+        presentDesktop = true;
+        // Keep the interactive menu's mirror current while it is being adjusted.
         if (vr_menu_interactive()) {
-            presentDesktop = true;
+            updateDesktopMirror = true;
         }
 #ifdef __ANDROID__
         // Standalone headset: no desktop window exists, so no mirror copy, ImGui frame or swap.
         presentDesktop = false;
+        updateDesktopMirror = false;
 #endif
 
         mVrFrameCounter++;
-        vr_set_frame_plan(renderEyes, renderHud, presentDesktop);
+        vr_set_frame_plan(renderEyes, renderHud, updateDesktopMirror);
     }
 
     auto gui = wnd->GetGui();
