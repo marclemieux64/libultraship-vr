@@ -100,6 +100,7 @@ static float vr_hud_panel_f(int child, int hand, const char* field, float def);
 static constexpr float kWristPack = 0.5f;
 static constexpr float kWristCanvasW = 160.0f; // native px per hand canvas
 static bool vr_wrist_panel_pose(int hand, XrPosef* pose, float* mpu, float* w_units, float* h_units);
+static int vr_hud_el_hand(int el);
 static void vr_hud_grab_update();
 static void vr_draw_test_card(vrgfx::Target t, uint32_t image, uint32_t w, uint32_t h);
 static void vr_refresh_rate_init();
@@ -313,6 +314,11 @@ static struct {
     float hud_block[2][4]; // per hand canvas block, native px (x0, y0, x1, y1)
     bool hud_block_valid[2];
     float hud_block_alpha[2];
+    // Background rectangles inside each wrist crop. The left wrist may use a second, separate
+    // card for physical-key icons while both cards retain one rigid wrist transform.
+    float hud_back[2][3][4]; // main card, Small Key card, Boss Key card
+    bool hud_back_valid[2][3];
+    float hud_key_display_scale[2] = { 1.0f, 1.0f };
     // World-anchored HUD (world-space pause): game-world centre/yaw/size, converted per frame.
     bool hud_world;
     glm::vec3 hud_world_center;
@@ -3211,6 +3217,76 @@ static float vr_panel_distance(const XrPosef& pose, float w, float h, const glm:
     return sqrtf(dx * dx + dy * dy + l.z * l.z);
 }
 
+bool vr_get_hud_element_hand_distance(int hand, int element, float* distance_m) {
+    if (distance_m == nullptr || hand < 0 || hand > 1 || element <= VR_HUD_EL_OTHER ||
+        element >= VR_HUD_EL_COUNT || !xr.initialized || !xr.hand_active[hand] ||
+        !vr_hud_wrist_layout() || !xr.hud_placed[element] || !xr.hud_rect_valid[element]) {
+        return false;
+    }
+    const int owner = vr_hud_el_hand(element);
+    XrPosef panel;
+    float mpu, wu, hu;
+    if (owner < 0 || !vr_wrist_panel_pose(owner, &panel, &mpu, &wu, &hu)) {
+        return false;
+    }
+    const glm::quat pq(panel.orientation.w, panel.orientation.x, panel.orientation.y, panel.orientation.z);
+    const glm::vec3 pc(panel.position.x, panel.position.y, panel.position.z);
+    if (element == VR_HUD_EL_PHYSICAL_KEYS || element == VR_HUD_EL_PHYSICAL_BOSS_KEY) {
+        // The key icons are submitted as independently cropped and scaled compositor cards. Use
+        // that exact card transform for interaction as well; reconstructing the target from the
+        // unscaled HUD slot made its grab zone drift away from the visible icon at large scales.
+        const int key = element == VR_HUD_EL_PHYSICAL_KEYS ? 0 : 1;
+        const int card = key + 1;
+        if (!xr.hud_back_valid[owner][card]) {
+            return false;
+        }
+        const float* base = xr.hud_block[owner];
+        const float* bounds = xr.hud_back[owner][card];
+        const float base_cx = ((base[0] + base[2]) * 0.5f - owner * kWristCanvasW) / kWristPack;
+        const float base_cy = (base[1] + base[3]) * 0.5f / kWristPack;
+        const float card_cx = ((bounds[0] + bounds[2]) * 0.5f - owner * kWristCanvasW) / kWristPack;
+        const float card_cy = (bounds[1] + bounds[3]) * 0.5f / kWristPack;
+        const float card_width = (bounds[2] - bounds[0]) / kWristPack;
+        const float card_height = (bounds[3] - bounds[1]) / kWristPack;
+        const float display_scale = xr.hud_key_display_scale[key];
+        const float side = key == 0 ? -1.0f : 1.0f;
+        const float card_shift_x = card_cx - base_cx + side * card_width * 0.5f * (display_scale - 1.0f);
+        const float card_shift_y = -(card_cy - base_cy);
+        // The complete visible card is the grab surface. Do not grow its lateral bounds by the
+        // grab radius: doing so made the two targets overlap and produced a large, apparently
+        // offset rounded box. The radius is used only as reach perpendicular to the card.
+        const float width = card_width * display_scale;
+        const float height = card_height * display_scale;
+        const glm::vec3 center = pc + pq * glm::vec3(card_shift_x * mpu, card_shift_y * mpu, 0.0f);
+        XrPosef card_pose = panel;
+        card_pose.position = { center.x, center.y, center.z };
+        const XrPosef& grip = xr.grip_pose_raw[hand];
+        const glm::vec3 hand_pos(grip.position.x, grip.position.y, grip.position.z);
+        const glm::vec3 local = glm::inverse(pq) * (hand_pos - center);
+        if (fabsf(local.x) > width * mpu * 0.5f || fabsf(local.y) > height * mpu * 0.5f) {
+            *distance_m = 1.0e30f;
+        } else {
+            *distance_m = fabsf(local.z);
+        }
+        return true;
+    }
+    const float x0 = (xr.hud_slot[element][0] - owner * kWristCanvasW) / kWristPack;
+    const float y0 = xr.hud_slot[element][1] / kWristPack;
+    const float scale = xr.hud_slot[element][2] / kWristPack;
+    float x1 = x0 + (xr.hud_rect[element][2] - xr.hud_rect[element][0]) * scale;
+    float y1 = y0 + (xr.hud_rect[element][3] - xr.hud_rect[element][1]) * scale;
+    float center_x = (x0 + x1) * 0.5f - wu * 0.5f;
+    float width = x1 - x0, height = y1 - y0;
+    const glm::vec3 center = pc + pq * glm::vec3(center_x * mpu,
+                                                  (hu * 0.5f - (y0 + y1) * 0.5f) * mpu, 0.0f);
+    XrPosef element_pose = panel;
+    element_pose.position = { center.x, center.y, center.z };
+    const XrPosef& grip = xr.grip_pose_raw[hand];
+    *distance_m = vr_panel_distance(element_pose, width * mpu, height * mpu,
+                                    glm::vec3(grip.position.x, grip.position.y, grip.position.z));
+    return true;
+}
+
 // In-headset HUD editing. Runs every XR frame after input is read and the raw grips are known,
 // before the game reads input for its next tick, so what it swallows never reaches gameplay:
 //   A / X + grip near the OTHER wrist's panel: grab the panel. It follows the grabbing hand
@@ -3488,7 +3564,7 @@ void vr_end_frame() {
                                  std::max(xr.hud_world_size[1] * canvas[1] / ws, 0.01f) };
     }
 
-    XrCompositionLayerQuad wrist_layers[2];
+    XrCompositionLayerQuad wrist_layers[6];
     uint32_t wrist_count = 0;
     const bool wrist_layout = vr_hud_wrist_layout();
     if (wrist_layout && !xr.hud_world && xr.hud_ever_rendered && xr.hud_commands != nullptr) {
@@ -3505,18 +3581,43 @@ void vr_end_frame() {
                 continue;
             }
 
-            XrCompositionLayerQuad& L = wrist_layers[wrist_count++];
-            L = { XR_TYPE_COMPOSITION_LAYER_QUAD };
-            L.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-            L.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-            L.space = xr.local_space;
-            L.subImage.swapchain = sc.handle;
-            L.subImage.imageRect.offset = { (int32_t)(b[0] * sx), (int32_t)(b[1] * sy) };
-            L.subImage.imageRect.extent = { std::max((int32_t)((b[2] - b[0]) * sx + 0.5f), 1),
-                                            std::max((int32_t)((b[3] - b[1]) * sy + 0.5f), 1) };
-            L.subImage.imageArrayIndex = 0;
-            L.pose = pose;
-            L.size = { std::max(w_units * mpu, 0.005f), std::max(h_units * mpu, 0.005f) };
+            const glm::quat panel_q(pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z);
+            const float base_cx = ((b[0] + b[2]) * 0.5f - hand * kWristCanvasW) / kWristPack;
+            const float base_cy = (b[1] + b[3]) * 0.5f / kWristPack;
+            for (int card = 0; card < 3; ++card) {
+                if (!xr.hud_back_valid[hand][card]) continue;
+                const float* cb = xr.hud_back[hand][card];
+                float card_w_units = (cb[2] - cb[0]) / kWristPack;
+                float card_h_units = (cb[3] - cb[1]) / kWristPack;
+                const float card_cx = ((cb[0] + cb[2]) * 0.5f - hand * kWristCanvasW) / kWristPack;
+                const float card_cy = (cb[1] + cb[3]) * 0.5f / kWristPack;
+                float shift_x = card_cx - base_cx;
+                if (card > 0) {
+                    const float display_scale = xr.hud_key_display_scale[card - 1];
+                    const float side = card == 1 ? -1.0f : 1.0f;
+                    shift_x += side * card_w_units * 0.5f * (display_scale - 1.0f);
+                    card_w_units *= display_scale;
+                    card_h_units *= display_scale;
+                }
+                const glm::vec3 shift = panel_q * glm::vec3(shift_x * mpu,
+                                                             -(card_cy - base_cy) * mpu, 0.0f);
+
+                XrCompositionLayerQuad& L = wrist_layers[wrist_count++];
+                L = { XR_TYPE_COMPOSITION_LAYER_QUAD };
+                L.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                L.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                L.space = xr.local_space;
+                L.subImage.swapchain = sc.handle;
+                L.subImage.imageRect.offset = { (int32_t)(cb[0] * sx), (int32_t)(cb[1] * sy) };
+                L.subImage.imageRect.extent = { std::max((int32_t)((cb[2] - cb[0]) * sx + 0.5f), 1),
+                                                std::max((int32_t)((cb[3] - cb[1]) * sy + 0.5f), 1) };
+                L.subImage.imageArrayIndex = 0;
+                L.pose = pose;
+                L.pose.position.x += shift.x;
+                L.pose.position.y += shift.y;
+                L.pose.position.z += shift.z;
+                L.size = { std::max(card_w_units * mpu, 0.005f), std::max(card_h_units * mpu, 0.005f) };
+            }
         }
     }
 
@@ -4944,6 +5045,8 @@ static int vr_hud_el_hand(int el) {
         case VR_HUD_EL_KEYS:
         case VR_HUD_EL_TIMER:
         case VR_HUD_EL_GAME_TIMER:
+        case VR_HUD_EL_PHYSICAL_KEYS:
+        case VR_HUD_EL_PHYSICAL_BOSS_KEY:
             return 0;
         case VR_HUD_EL_BTN_B:
         case VR_HUD_EL_BTN_A:
@@ -4972,13 +5075,14 @@ static int vr_hud_el_hand(int el) {
 // doubled in resolution to match, so elements are exactly as sharp as before).
 static const int kWristRows[2][16] = {
     { VR_HUD_EL_HEARTS, -1, VR_HUD_EL_MAGIC, -1, VR_HUD_EL_RUPEES, VR_HUD_EL_KEYS, -1, VR_HUD_EL_TIMER,
-      VR_HUD_EL_GAME_TIMER, -2 },
+      VR_HUD_EL_GAME_TIMER, -1, VR_HUD_EL_PHYSICAL_KEYS, VR_HUD_EL_PHYSICAL_BOSS_KEY, -2 },
     { -3, VR_HUD_EL_BTN_DPAD, VR_HUD_EL_MOUNT, -1, VR_HUD_EL_MINIMAP, -2 }, // -3 = the button cluster
 };
 static constexpr float kWristCanvasH = 240.0f;
 static constexpr float kWristRegionW = kWristCanvasW / kWristPack; // layout units per hand
 static constexpr float kWristRegionH = kWristCanvasH / kWristPack;
 static constexpr float kWristGap = 3.0f;                    // between auto-laid-out elements, units
+static constexpr float kPhysicalKeyGap = 30.0f;             // visible seam between the two key cards
 
 // The settings profile in effect: Link's age, unless the menu forces one for preview.
 static int vr_hud_profile() {
@@ -5188,6 +5292,13 @@ static void vr_hud_latch_and_layout() {
             char name[96];
             VrHudElementCVar(name, sizeof(name), child, d->key, "Scale");
             el_scale[el] = std::clamp(CVarGetFloat(name, d->scale[child]), 10.0f, 500.0f) / 100.0f;
+            if (el == VR_HUD_EL_PHYSICAL_KEYS || el == VR_HUD_EL_PHYSICAL_BOSS_KEY) {
+                const int key = el == VR_HUD_EL_PHYSICAL_KEYS ? 0 : 1;
+                xr.hud_key_display_scale[key] = el_scale[el];
+                // Keep a compact, non-overlapping copy in the shared HUD texture. Its compositor
+                // card applies the requested visual scale independently after cropping.
+                el_scale[el] = 1.0f;
+            }
             VrHudElementCVar(name, sizeof(name), child, d->key, "X");
             el_off[el][0] = CVarGetFloat(name, d->x[child]);
             VrHudElementCVar(name, sizeof(name), child, d->key, "Y");
@@ -5214,12 +5325,38 @@ static void vr_hud_latch_and_layout() {
             for (int k = 0; k < row_n; k++) {
                 row_h = std::max(row_h, el_h(row[k]));
             }
+            float row_w = 0.0f;
+            bool physical_key_row = false;
+            for (int k = 0; k < row_n; ++k) {
+                row_w += el_w(row[k]);
+                if (k + 1 < row_n) row_w += kWristGap;
+                physical_key_row |= row[k] == VR_HUD_EL_PHYSICAL_KEYS ||
+                                    row[k] == VR_HUD_EL_PHYSICAL_BOSS_KEY;
+            }
             float x = pad;
+            float physical_center = 0.0f;
+            if (physical_key_row) {
+                const float configured_w = vr_hud_panel_f(child, hand, "Width", pd.width);
+                const float parent_w = configured_w > 0.0f ? configured_w : max_x + pad;
+                physical_center = parent_w * 0.5f + CVarGetFloat("gVrPhysicalKeysOffsetX", 0.0f);
+            }
             for (int k = 0; k < row_n; k++) {
                 const int el = row[k];
                 const float w = el_w(el);
                 const float h = el_h(el);
-                float fx = x + el_off[el][0];
+                float base_x = x;
+                if (physical_key_row) {
+                    if (row_n == 1) {
+                        base_x = physical_center - w * 0.5f;
+                    } else if (el == VR_HUD_EL_PHYSICAL_KEYS) {
+                        base_x = physical_center - kPhysicalKeyGap * 0.5f - w;
+                    } else if (el == VR_HUD_EL_PHYSICAL_BOSS_KEY) {
+                        base_x = physical_center + kPhysicalKeyGap * 0.5f;
+                    }
+                }
+                // The two physical-key cards are one horizontal pair. A shared offset moves the
+                // pair without allowing stale per-icon X settings to pull its centre gap apart.
+                float fx = base_x + (physical_key_row ? 0.0f : el_off[el][0]);
                 float fy = y + (row_h - h) * 0.5f + el_off[el][1];
                 fx = std::clamp(fx, 0.0f, std::max(kWristRegionW - w, 0.0f));
                 fy = std::clamp(fy, 0.0f, std::max(kWristRegionH - h, 0.0f));
@@ -5229,7 +5366,7 @@ static void vr_hud_latch_and_layout() {
                 xr.hud_placed[el] = true;
                 max_x = std::max(max_x, fx + w);
                 max_y = std::max(max_y, fy + h);
-                x += w + kWristGap;
+                if (!physical_key_row) x += w + kWristGap;
             }
             y += row_h + kWristGap;
             row_n = 0;
@@ -5305,26 +5442,65 @@ static void vr_hud_latch_and_layout() {
         }
         flush_row();
 
-        // The card: fitted to the elements plus padding, or the size set in the settings.
+        // Size the original wrist card from original HUD elements only. Physical keys are separate
+        // child cards and must never move or resize this parent card.
+        float main_max_x = 0.0f, main_max_y = 0.0f, main_alpha = 0.0f;
+        bool main_any = false;
+        for (int el = 0; el < VR_HUD_EL_COUNT; ++el) {
+            if (!xr.hud_placed[el] || vr_hud_el_hand(el) != hand ||
+                el == VR_HUD_EL_PHYSICAL_KEYS || el == VR_HUD_EL_PHYSICAL_BOSS_KEY) continue;
+            const float x0 = (xr.hud_slot[el][0] - hand * kWristCanvasW) / kWristPack;
+            const float y0 = xr.hud_slot[el][1] / kWristPack;
+            main_max_x = std::max(main_max_x, x0 + el_w(el));
+            main_max_y = std::max(main_max_y, y0 + el_h(el));
+            main_alpha = std::max(main_alpha, xr.hud_alpha[el]);
+            main_any = true;
+        }
         float card_w = vr_hud_panel_f(child, hand, "Width", pd.width);
         float card_h = vr_hud_panel_f(child, hand, "Height", pd.height);
         if (card_w <= 0.0f) {
-            card_w = max_x + pad;
+            card_w = main_max_x + pad;
         }
         if (card_h <= 0.0f) {
-            card_h = max_y + pad;
+            card_h = main_max_y + pad;
         }
         card_w = std::clamp(card_w, 4.0f, kWristRegionW);
         card_h = std::clamp(card_h, 4.0f, kWristRegionH);
 
-        xr.hud_block_valid[hand] = any;
-        if (any) {
+        xr.hud_block_valid[hand] = main_any;
+        if (main_any) {
             xr.hud_block[hand][0] = hand * kWristCanvasW;
             xr.hud_block[hand][1] = 0.0f;
             xr.hud_block[hand][2] = hand * kWristCanvasW + card_w * kWristPack;
             xr.hud_block[hand][3] = card_h * kWristPack;
         }
-        xr.hud_block_alpha[hand] = block_alpha;
+        xr.hud_block_alpha[hand] = main_alpha;
+
+        // Three independently cropped cards share the parent's wrist transform: original HUD,
+        // Small Key, and Boss Key. Each key card is fitted only to its own icon.
+        for (int card = 0; card < 3; ++card) xr.hud_back_valid[hand][card] = false;
+        xr.hud_back_valid[hand][0] = main_any;
+        if (main_any) {
+            memcpy(xr.hud_back[hand][0], xr.hud_block[hand], sizeof(xr.hud_block[hand]));
+        }
+        if (hand == 0) {
+            // Leave a real transparent seam between the two cards (the row gap is 3 units).
+            const float box_pad = std::min(std::max(1.0f, pad * 0.33f), kWristGap * 0.4f);
+            const int key_elements[2] = { VR_HUD_EL_PHYSICAL_KEYS, VR_HUD_EL_PHYSICAL_BOSS_KEY };
+            for (int key = 0; key < 2; ++key) {
+                const int el = key_elements[key];
+                if (!xr.hud_placed[el]) continue;
+                const float x0 = (xr.hud_slot[el][0] - hand * kWristCanvasW) / kWristPack;
+                const float y0 = xr.hud_slot[el][1] / kWristPack;
+                xr.hud_back[hand][key + 1][0] = hand * kWristCanvasW + std::max(x0 - box_pad, 0.0f) * kWristPack;
+                xr.hud_back[hand][key + 1][1] = std::max(y0 - box_pad, 0.0f) * kWristPack;
+                xr.hud_back[hand][key + 1][2] = hand * kWristCanvasW +
+                    std::min(x0 + el_w(el) + box_pad, kWristRegionW) * kWristPack;
+                xr.hud_back[hand][key + 1][3] =
+                    std::min(y0 + el_h(el) + box_pad, kWristRegionH) * kWristPack;
+                xr.hud_back_valid[hand][key + 1] = true;
+            }
+        }
     }
 }
 
@@ -5370,14 +5546,22 @@ void vr_begin_hud() {
             if (!xr.hud_block_valid[hand] || backing <= 0.0f) {
                 continue;
             }
-            const float* b = xr.hud_block[hand];
-            const int32_t x0 = (int32_t)(b[0] * sx), y0 = (int32_t)(b[1] * sy);
-            const vrgfx::Rect rect = { x0, y0, (int32_t)(b[2] * sx + 0.5f) - x0, (int32_t)(b[3] * sy + 0.5f) - y0 };
             // In-headset editing: tint the card while a hand is in reach (blue) / holding it.
             const float a = std::max(backing * xr.hud_block_alpha[hand], xr.grab.hover[hand] ? 0.6f : 0.0f);
             const float tint = xr.grab.hover[hand] == 2 ? 0.35f : (xr.grab.hover[hand] == 1 ? 0.18f : 0.0f);
             const float dark[4] = { 0.0f, tint * 0.4f * a, tint * a, a };
-            xr.gfx->ClearColorRects(vrgfx::Target::Hud, image_index, &rect, 1, dark);
+            vrgfx::Rect rects[3];
+            int rect_count = 0;
+            for (int card = 0; card < 3; ++card) {
+                if (!xr.hud_back_valid[hand][card]) continue;
+                const float* b = xr.hud_back[hand][card];
+                const int32_t x0 = (int32_t)(b[0] * sx), y0 = (int32_t)(b[1] * sy);
+                rects[rect_count++] = { x0, y0, (int32_t)(b[2] * sx + 0.5f) - x0,
+                                       (int32_t)(b[3] * sy + 0.5f) - y0 };
+            }
+            if (rect_count > 0) {
+                xr.gfx->ClearColorRects(vrgfx::Target::Hud, image_index, rects, rect_count, dark);
+            }
         }
         for (int el = 0; el < VR_HUD_EL_COUNT; el++) {
             xr.hud_meas_any[el] = false;
@@ -5797,6 +5981,10 @@ void vr_set_hud_world_panel(bool, const float*, float, float, float) {}
 bool vr_hud_tri(const float*, float* out) { out[0] = out[3] = 1.0f; out[1] = out[2] = 0.0f; return true; }
 void vr_set_hud_child(bool) {}
 bool vr_get_hud_child() { return false; }
+bool vr_get_hud_element_hand_distance(int, int, float* distance_m) {
+    if (distance_m != nullptr) *distance_m = 0.0f;
+    return false;
+}
 bool vr_is_rendering_screen() { return false; }
 void vr_set_flat_screen(bool) {}
 bool vr_get_flat_screen() { return false; }

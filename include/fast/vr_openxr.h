@@ -278,6 +278,7 @@ bool vr_hud_tri(const float ndc_xy[6], float out_scale_offset[4]);
 // Link's age, for the Adult / Child wrist HUD settings profile (vr_hud_settings.h).
 void vr_set_hud_child(bool child);
 bool vr_get_hud_child();
+bool vr_get_hud_element_hand_distance(int hand, int element, float* distance_m);
 // World-anchored HUD quad (world-space pause): see VR_SetHudWorldPanel.
 void vr_set_hud_world_panel(bool enabled, const float center[3], float yaw, float width, float height);
 // Texture rectangles in stereo passes (world-space file select): see VR_SetRectWorldPanel. Plain

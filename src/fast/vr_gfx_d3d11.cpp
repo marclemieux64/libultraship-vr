@@ -433,7 +433,8 @@ class D3D11Backend final : public Backend {
         // Copying a two-layer source with CopyResource into the one-layer mirror is invalid. A
         // subresource copy works for both ordinary targets and EyeArray and preserves the raw bits.
         const UINT srcSubresource = D3D11CalcSubresource(0, 0, sd.MipLevels);
-        mContext->CopySubresourceRegion(c.tex.Get(), 0, 0, 0, 0, src, srcSubresource, nullptr);
+        D3D11_BOX source = { 0, 0, 0, sd.Width, sd.Height, 1 };
+        mContext->CopySubresourceRegion(c.tex.Get(), 0, 0, 0, 0, src, srcSubresource, &source);
     }
 
     void* MirrorTextureId(int slot) override {

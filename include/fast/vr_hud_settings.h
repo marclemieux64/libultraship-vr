@@ -66,6 +66,8 @@ static const VrHudElementDesc kVrHudElements[] = {
     { VR_HUD_EL_BTN_DPAD, "DPad", "D-Pad", 1, VR_HUD_EL_DEFAULT },
     { VR_HUD_EL_MOUNT, "Mount", "Carrots / Archery Score", 1, VR_HUD_EL_DEFAULT },
     { VR_HUD_EL_MINIMAP, "Minimap", "Minimap", 1, VR_HUD_EL_AT(-1.0f, -11.0f) },
+    { VR_HUD_EL_PHYSICAL_KEYS, "PhysicalKeys", "Physical Small Keys", 0, VR_HUD_EL_DEFAULT },
+    { VR_HUD_EL_PHYSICAL_BOSS_KEY, "PhysicalBossKey", "Physical Boss Key", 0, VR_HUD_EL_DEFAULT },
 };
 #undef VR_HUD_EL_AT
 #undef VR_HUD_EL_DEFAULT
