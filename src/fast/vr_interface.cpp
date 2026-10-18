@@ -149,8 +149,20 @@ bool VR_GetHandPose(int hand, float pos[3], float quat[4]) {
     return vr_get_hand_pose(hand, pos, quat);
 }
 
+bool VR_IsFrameController(int hand) {
+    return vr_is_frame_controller(hand);
+}
+
 bool VR_IsHandActive(int hand) {
     return vr_is_hand_active(hand);
+}
+
+uint16_t VR_GetBindingButtons(int hand) {
+    return vr_get_binding_buttons(hand);
+}
+
+void VR_GetBindingThumbstick(int hand, float* x, float* y) {
+    vr_get_binding_thumbstick(hand, x, y);
 }
 
 uint16_t VR_GetControllerButton(int hand) {

@@ -159,6 +159,10 @@ bool vr_get_hand_pose(int hand, float out_pos[3], float out_quat[4]);
 // origin + unit forward. For weapon aiming. False (and dir = -Z) if untracked.
 bool vr_get_aim_ray(int hand, float out_pos[3], float out_dir[3]);
 bool vr_is_hand_active(int hand);
+bool vr_is_frame_controller(int hand);
+// Latest synchronized physical inputs, before menu/gesture filtering. Binding editor only.
+uint16_t vr_get_binding_buttons(int hand);
+void vr_get_binding_thumbstick(int hand, float* x, float* y);
 uint16_t vr_get_controller_buttons(int hand);
 void vr_get_thumbstick(int hand, float* x, float* y);
 // Modal hand gestures (Alyx-style item selector): while suppressed, this hand's thumbstick
