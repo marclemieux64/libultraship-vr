@@ -105,6 +105,10 @@ static void vr_hud_grab_update();
 static void vr_draw_test_card(vrgfx::Target t, uint32_t image, uint32_t w, uint32_t h);
 static void vr_refresh_rate_init();
 static bool g_refresh_rate_retried = false; // one more rate query once frames are running
+// Live hand-model state pushed by the game. Keep it available to HUD contact testing so the
+// contact point can occupy the same calibrated, scaled hand that the player actually sees.
+static float g_hand_scale = 1.0f;
+static bool g_hand_mirror[2] = { false, false };
 
 // --------------------------------------------------------------------------
 // Internal state
@@ -259,8 +263,11 @@ static struct {
     XrSpace view_space;
     struct EyeSwapchain hud_swapchain;
     uint32_t hud_image_index;
-    void* hud_commands;
-    bool rendering_hud;
+      void* hud_commands;
+      bool rendering_hud;
+      bool key_world_pass;
+      bool key_world_saved_rect;
+      float key_world_saved_mtx[4][4];
 
     // Text panel: the message system (dialogue, signs, item text, the ocarina staff) on its own
     // quad that soft-follows in front of the player. Real metres in local_space, independent of
@@ -3217,6 +3224,126 @@ static float vr_panel_distance(const XrPosef& pose, float w, float h, const glm:
     return sqrtf(dx * dx + dy * dy + l.z * l.z);
 }
 
+// Exact raw-tracking-space pose and dimensions used to submit a physical-key compositor card.
+// Interaction consumes this same description, so layout, per-key scale and the anchored centre
+// shift cannot diverge from the visible card.
+static bool vr_hud_key_card_raw(int element, XrPosef* out_pose, float* out_width_m, float* out_height_m) {
+    if (out_pose == nullptr || out_width_m == nullptr || out_height_m == nullptr ||
+        (element != VR_HUD_EL_PHYSICAL_KEYS && element != VR_HUD_EL_PHYSICAL_BOSS_KEY) ||
+        !xr.initialized || !vr_hud_wrist_layout()) return false;
+    const int owner = vr_hud_el_hand(element);
+    XrPosef panel;
+    float mpu, wu, hu;
+    if (owner < 0 || !vr_wrist_panel_pose(owner, &panel, &mpu, &wu, &hu)) return false;
+    const int key = element == VR_HUD_EL_PHYSICAL_KEYS ? 0 : 1;
+    const int card = key + 1;
+    if (!xr.hud_placed[element] || !xr.hud_rect_valid[element] || !xr.hud_back_valid[owner][card]) return false;
+    const float* base = xr.hud_block[owner];
+    const float* bounds = xr.hud_back[owner][card];
+    const float base_cx = ((base[0] + base[2]) * 0.5f - owner * kWristCanvasW) / kWristPack;
+    const float base_cy = (base[1] + base[3]) * 0.5f / kWristPack;
+    const float card_cx = ((bounds[0] + bounds[2]) * 0.5f - owner * kWristCanvasW) / kWristPack;
+    const float card_cy = (bounds[1] + bounds[3]) * 0.5f / kWristPack;
+    const float card_width = (bounds[2] - bounds[0]) / kWristPack;
+    const float card_height = (bounds[3] - bounds[1]) / kWristPack;
+    const float display_scale = xr.hud_key_display_scale[key];
+    const float side = key == 0 ? -1.0f : 1.0f;
+    const float shift_x = card_cx - base_cx + side * card_width * 0.5f * (display_scale - 1.0f);
+    const float shift_y = -(card_cy - base_cy);
+    const glm::quat q(panel.orientation.w, panel.orientation.x, panel.orientation.y, panel.orientation.z);
+    const glm::vec3 center = glm::vec3(panel.position.x, panel.position.y, panel.position.z) +
+                             q * glm::vec3(shift_x * mpu, shift_y * mpu, 0.0f);
+    *out_pose = panel;
+    out_pose->position = { center.x, center.y, center.z };
+    *out_width_m = card_width * display_scale * mpu;
+    *out_height_m = card_height * display_scale * mpu;
+    return true;
+}
+
+// Raw tracking-space pose that drives the visible hand. A held-object simulation can displace the
+// rendered hand from the controller, so HUD contact must follow that same displacement.
+static XrPosef vr_effective_grip_pose_raw(int hand) {
+    float sp[3];
+    float sq[4];
+    if (vrphys_get_hand_sim_pose_raw(hand, sp, sq)) {
+        XrPosef p;
+        p.position = { sp[0], sp[1], sp[2] };
+        p.orientation = { sq[0], sq[1], sq[2], sq[3] };
+        return p;
+    }
+    return xr.grip_pose_raw[hand];
+}
+
+// The shared model-to-grip calibration used by both live hand rendering and wrist-HUD contact.
+static void vr_hand_calibration(int hand, glm::vec3* cal_deg, glm::vec3* off_cm, int* mirror_axis,
+                                bool* mirrored) {
+    int axis = CVarGetInteger("gVrHandMirrorAxis", 2);
+    if (axis < 0 || axis > 2) axis = 2;
+    glm::vec3 cal(CVarGetFloat("gVrHandCalPitch", 88.0f), CVarGetFloat("gVrHandCalYaw", -100.0f),
+                  CVarGetFloat("gVrHandCalRoll", 80.0f));
+    glm::vec3 off(CVarGetFloat("gVrHandOffX", 0.0f), CVarGetFloat("gVrHandOffY", 6.3f),
+                  CVarGetFloat("gVrHandOffZ", 0.0f));
+    const bool mirror = g_hand_mirror[hand];
+    if (hand == 0 && CVarGetInteger("gVrHandLOverride", 1)) {
+        cal = glm::vec3(CVarGetFloat("gVrHandLCalPitch", -149.0f), CVarGetFloat("gVrHandLCalYaw", 76.0f),
+                        CVarGetFloat("gVrHandLCalRoll", 30.0f));
+        off = glm::vec3(CVarGetFloat("gVrHandLOffX", 0.0f), CVarGetFloat("gVrHandLOffY", 6.3f),
+                        CVarGetFloat("gVrHandLOffZ", 0.0f));
+    } else if (hand == 1 || !mirror) {
+        for (int k = 0; k < 3; k++) {
+            if (k != axis) cal[k] = -cal[k];
+        }
+        off[axis] = -off[axis];
+    }
+    *cal_deg = cal;
+    *off_cm = off;
+    *mirror_axis = axis;
+    *mirrored = mirror;
+}
+
+// Contact centre of the ACTUALLY RENDERED hand, converted back to raw tracking space for comparison
+// with compositor cards. The hand renderer composes its pose in game-world space; rebuilding a point
+// directly from grip_pose_raw misses the interpolated anchor-yaw frame and can be displaced by tens
+// of centimetres from the mesh visible in the eye image.
+static glm::vec3 vr_visible_hand_contact_raw(int hand) {
+    const XrPosef p = apply_turn(vr_effective_grip_pose_raw(hand));
+    const glm::quat q(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z);
+    glm::vec3 cal_deg, off_cm;
+    int mirror_axis;
+    bool mirrored;
+    vr_hand_calibration(hand, &cal_deg, &off_cm, &mirror_axis, &mirrored);
+    const float kDeg = 3.14159265358979323846f / 180.0f;
+    const glm::quat model_q = q * glm::quat(cal_deg * kDeg);
+    float model_x_sign = 1.0f;
+    if (mirrored && mirror_axis == 0) model_x_sign = -1.0f;
+
+    glm::vec3 anchor(0.0f);
+    float gamma = 0.0f;
+    if (xr.first_person && xr.anchor_initialized) {
+        anchor = vr_anchor_now();
+        gamma = xr.anchor_gamma_prev + (xr.anchor_gamma - xr.anchor_gamma_prev) * xr.interp_alpha;
+    }
+    const float ws = std::max(xr.world_scale, 1.0f);
+    // Open-hand assets run from the wrist along model +X (862 adult / 548 child units). The palm
+    // centre is about 30% along that span. Apply this in the same calibrated model frame and scale
+    // used by vr_get_hand_matrix, so the contact volume occupies the visible palm rather than the
+    // controller/wrist origin behind it.
+    const float model_length = vr_hud_profile() ? 548.0f : 862.0f;
+    const glm::vec3 palm_from_root_world =
+        model_q * glm::vec3(model_x_sign * model_length * g_hand_scale * 0.30f, 0.0f, 0.0f);
+    const glm::vec3 rendered_world =
+        anchor + (glm::vec3(p.position.x, p.position.y, p.position.z) + q * (off_cm * 0.01f)) * ws +
+        palm_from_root_world;
+
+    // Exact positional inverse of the camera/compositor mapping used by game_world_to_raw:
+    // world = anchor + unyaw(gamma) * (turn * raw) * world_scale.
+    const float cg = cosf(gamma), sg = sinf(gamma);
+    const glm::mat3 unyaw(glm::vec3(cg, 0.0f, sg), glm::vec3(0.0f, 1.0f, 0.0f),
+                          glm::vec3(-sg, 0.0f, cg));
+    const glm::vec3 turned = glm::transpose(unyaw) * ((rendered_world - anchor) / ws);
+    return glm::inverse(g_turn_rot) * (turned - g_turn_off);
+}
+
 bool vr_get_hud_element_hand_distance(int hand, int element, float* distance_m) {
     if (distance_m == nullptr || hand < 0 || hand > 1 || element <= VR_HUD_EL_OTHER ||
         element >= VR_HUD_EL_COUNT || !xr.initialized || !xr.hand_active[hand] ||
@@ -3232,42 +3359,13 @@ bool vr_get_hud_element_hand_distance(int hand, int element, float* distance_m) 
     const glm::quat pq(panel.orientation.w, panel.orientation.x, panel.orientation.y, panel.orientation.z);
     const glm::vec3 pc(panel.position.x, panel.position.y, panel.position.z);
     if (element == VR_HUD_EL_PHYSICAL_KEYS || element == VR_HUD_EL_PHYSICAL_BOSS_KEY) {
-        // The key icons are submitted as independently cropped and scaled compositor cards. Use
-        // that exact card transform for interaction as well; reconstructing the target from the
-        // unscaled HUD slot made its grab zone drift away from the visible icon at large scales.
-        const int key = element == VR_HUD_EL_PHYSICAL_KEYS ? 0 : 1;
-        const int card = key + 1;
-        if (!xr.hud_back_valid[owner][card]) {
-            return false;
-        }
-        const float* base = xr.hud_block[owner];
-        const float* bounds = xr.hud_back[owner][card];
-        const float base_cx = ((base[0] + base[2]) * 0.5f - owner * kWristCanvasW) / kWristPack;
-        const float base_cy = (base[1] + base[3]) * 0.5f / kWristPack;
-        const float card_cx = ((bounds[0] + bounds[2]) * 0.5f - owner * kWristCanvasW) / kWristPack;
-        const float card_cy = (bounds[1] + bounds[3]) * 0.5f / kWristPack;
-        const float card_width = (bounds[2] - bounds[0]) / kWristPack;
-        const float card_height = (bounds[3] - bounds[1]) / kWristPack;
-        const float display_scale = xr.hud_key_display_scale[key];
-        const float side = key == 0 ? -1.0f : 1.0f;
-        const float card_shift_x = card_cx - base_cx + side * card_width * 0.5f * (display_scale - 1.0f);
-        const float card_shift_y = -(card_cy - base_cy);
-        // The complete visible card is the grab surface. Do not grow its lateral bounds by the
-        // grab radius: doing so made the two targets overlap and produced a large, apparently
-        // offset rounded box. The radius is used only as reach perpendicular to the card.
-        const float width = card_width * display_scale;
-        const float height = card_height * display_scale;
-        const glm::vec3 center = pc + pq * glm::vec3(card_shift_x * mpu, card_shift_y * mpu, 0.0f);
-        XrPosef card_pose = panel;
-        card_pose.position = { center.x, center.y, center.z };
-        const XrPosef& grip = xr.grip_pose_raw[hand];
-        const glm::vec3 hand_pos(grip.position.x, grip.position.y, grip.position.z);
-        const glm::vec3 local = glm::inverse(pq) * (hand_pos - center);
-        if (fabsf(local.x) > width * mpu * 0.5f || fabsf(local.y) > height * mpu * 0.5f) {
-            *distance_m = 1.0e30f;
-        } else {
-            *distance_m = fabsf(local.z);
-        }
+        // The finite visible compositor card is the target. Measure it against the controller-held
+        // centre of the rendered hand; gVrKeyGrabRadius supplies the hand's physical thickness.
+        XrPosef card_pose;
+        float card_width_m, card_height_m;
+        if (!vr_hud_key_card_raw(element, &card_pose, &card_width_m, &card_height_m)) return false;
+        *distance_m = vr_panel_distance(card_pose, card_width_m, card_height_m,
+                                        vr_visible_hand_contact_raw(hand));
         return true;
     }
     const float x0 = (xr.hud_slot[element][0] - owner * kWristCanvasW) / kWristPack;
@@ -3584,7 +3682,8 @@ void vr_end_frame() {
             const glm::quat panel_q(pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z);
             const float base_cx = ((b[0] + b[2]) * 0.5f - hand * kWristCanvasW) / kWristPack;
             const float base_cy = (b[1] + b[3]) * 0.5f / kWristPack;
-            for (int card = 0; card < 3; ++card) {
+            // Physical keys are rendered into the stereo projection pass for real depth occlusion.
+            for (int card = 0; card < 1; ++card) {
                 if (!xr.hud_back_valid[hand][card]) continue;
                 const float* cb = xr.hud_back[hand][card];
                 float card_w_units = (cb[2] - cb[0]) / kWristPack;
@@ -4494,15 +4593,7 @@ void vr_set_interp_alpha(float alpha) {
 // press against surfaces and lag with inertia. Sim state is raw tracking space, so the artificial
 // turn is applied here exactly like everything else game-facing.
 static XrPosef vr_effective_grip_pose(int hand) {
-    float sp[3];
-    float sq[4];
-    if (vrphys_get_hand_sim_pose_raw(hand, sp, sq)) {
-        XrPosef p;
-        p.position = { sp[0], sp[1], sp[2] };
-        p.orientation = { sq[0], sq[1], sq[2], sq[3] };
-        return apply_turn(p);
-    }
-    return xr.grip_pose[hand];
+    return apply_turn(vr_effective_grip_pose_raw(hand));
 }
 
 bool vr_get_hand_pose(int hand, float out_pos[3], float out_quat[4]) {
@@ -4673,10 +4764,6 @@ void vr_trigger_haptic(int hand, float amplitude01, float freq_hz, float duratio
 // hands judder (the camera is smooth for the same reason — it's replaced live per eye). g_hand_scale
 // is Link's model scale, folded into the hand matrix so the live-replaced hand renders at full size.
 static std::unordered_map<const void*, int> g_hand_mtx_registry;
-static float g_hand_scale = 1.0f;
-static bool g_hand_mirror[2] = { false, false }; // per controller hand: reflect the hand geometry
-                                                 // (flip handedness) when it drives Link's
-                                                 // opposite-side hand model
 
 // Hand draw matrix (model-local -> game-world) in the engine's row-vector MtxF layout, for pinning
 // Link's hand limb to the controller. Same world position as vr_get_hand_pose (anchor + grip_pos *
@@ -4704,33 +4791,19 @@ bool vr_get_hand_matrix(int hand, float out[4][4]) {
     // along model +X (the sword blade extends along hand-space +X, see the melee weapon tip/base in
     // z_player_lib.c), so the left<->right symmetry plane must KEEP X and flip the thumb axis —
     // default Z. Reflecting X itself (old default) turns the mesh inside-out instead of opposite-handed.
-    int axis = CVarGetInteger("gVrHandMirrorAxis", 2);
-    if (axis < 0 || axis > 2) axis = 2;
-    const bool mirrored = g_hand_mirror[hand];
+    int axis;
+    bool mirrored;
     // Calibration (model rest pose -> controller grip frame). Defaults were hand-tuned in-headset
     // against the MIRRORED sword hand on the right controller, which uses the mirror-conjugate of
     // these values (F * cal * F: the Euler component about the mirror axis is preserved, the other
     // two are negated). An UNMIRRORED hand also uses the conjugate regardless of controller: OpenXR
     // grip frames are defined per-hand (palm-relative), so mirror-symmetric physical poses report
     // the same orientation — an unreflected mesh attaches with the same rotation on either side.
-    glm::vec3 calDeg(CVarGetFloat("gVrHandCalPitch", 88.0f), CVarGetFloat("gVrHandCalYaw", -100.0f),
-                     CVarGetFloat("gVrHandCalRoll", 80.0f));
+    glm::vec3 calDeg;
     // Positional offset (real cm) in the controller grip frame, so the hand mesh can be nudged
     // to sit naturally on the controller; the conjugate reflects it (negate the mirror-axis component).
-    glm::vec3 off(CVarGetFloat("gVrHandOffX", 0.0f), CVarGetFloat("gVrHandOffY", 6.3f),
-                  CVarGetFloat("gVrHandOffZ", 0.0f));
-    if (hand == 0 && CVarGetInteger("gVrHandLOverride", 1)) {
-        // Fully independent left-controller tuning (values used literally, no conjugation).
-        calDeg = glm::vec3(CVarGetFloat("gVrHandLCalPitch", -149.0f), CVarGetFloat("gVrHandLCalYaw", 76.0f),
-                           CVarGetFloat("gVrHandLCalRoll", 30.0f));
-        off = glm::vec3(CVarGetFloat("gVrHandLOffX", 0.0f), CVarGetFloat("gVrHandLOffY", 6.3f),
-                        CVarGetFloat("gVrHandLOffZ", 0.0f));
-    } else if (hand == 1 || !mirrored) {
-        for (int k = 0; k < 3; k++) {
-            if (k != axis) calDeg[k] = -calDeg[k];
-        }
-        off[axis] = -off[axis];
-    }
+    glm::vec3 off;
+    vr_hand_calibration(hand, &calDeg, &off, &axis, &mirrored);
     // The offsets are real centimetres (how the hand sits on the controller is about the player's
     // grip, not the game world), so they hold at any world scale.
     off *= 0.01f * xr.world_scale;
@@ -5116,6 +5189,47 @@ void vr_hud_marker(uint32_t w1) {
         el = VR_HUD_EL_NONE;
     }
     xr.hud_el = el;
+    if (xr.key_world_pass) {
+        g_vr_rect_world = false;
+        if (el == VR_HUD_EL_PHYSICAL_KEYS || el == VR_HUD_EL_PHYSICAL_BOSS_KEY) {
+            XrPosef raw;
+            float width_m, height_m;
+            if (vr_hud_key_card_raw(el, &raw, &width_m, &height_m) && xr.hud_rect_valid[el]) {
+                const XrPosef turned = apply_turn(raw);
+                glm::vec3 anchor(0.0f);
+                float gamma = 0.0f;
+                if (xr.anchor_initialized) {
+                    anchor = vr_anchor_now();
+                    gamma = xr.anchor_gamma_prev + (xr.anchor_gamma - xr.anchor_gamma_prev) * xr.interp_alpha;
+                }
+                const float cg = cosf(gamma), sg = sinf(gamma);
+                const glm::mat3 unyaw(glm::vec3(cg, 0.0f, sg), glm::vec3(0.0f, 1.0f, 0.0f),
+                                      glm::vec3(-sg, 0.0f, cg));
+                const float ws = std::max(xr.world_scale, 1.0f);
+                const glm::vec3 center = anchor + unyaw *
+                    (glm::vec3(turned.position.x, turned.position.y, turned.position.z) * ws);
+                const glm::quat tq(turned.orientation.w, turned.orientation.x,
+                                   turned.orientation.y, turned.orientation.z);
+                const glm::quat world_q = glm::normalize(glm::quat_cast(unyaw) * tq);
+                const float* r = xr.hud_rect[el];
+                const float x0 = r[0] / 160.0f - 1.0f;
+                const float x1 = r[2] / 160.0f - 1.0f;
+                const float y0 = 1.0f - r[1] / 120.0f;
+                const float y1 = 1.0f - r[3] / 120.0f;
+                const float cx = (x0 + x1) * 0.5f, cy = (y0 + y1) * 0.5f;
+                const float sx = width_m * ws / std::max(x1 - x0, 1.0e-5f);
+                const float sy = height_m * ws / std::max(y0 - y1, 1.0e-5f);
+                const glm::mat4 panel = glm::translate(glm::mat4(1.0f), center) * glm::mat4_cast(world_q) *
+                    glm::scale(glm::mat4(1.0f), glm::vec3(sx, sy, 1.0f)) *
+                    glm::translate(glm::mat4(1.0f), glm::vec3(-cx, -cy, 0.0f));
+                for (int c = 0; c < 4; ++c)
+                    for (int row = 0; row < 4; ++row)
+                        g_vr_rect_world_mtx[c][row] = panel[c][row];
+                g_vr_rect_world = true;
+            }
+        }
+        return;
+    }
     const uint8_t alpha = (uint8_t)((w1 >> 16) & 0xFF);
     if (alpha > xr.hud_meas_alpha[el]) {
         xr.hud_meas_alpha[el] = alpha;
@@ -5139,6 +5253,10 @@ bool vr_hud_tri(const float ndc[6], float out[4]) {
     const int el = xr.hud_el;
     out[0] = out[3] = 1.0f;
     out[1] = out[2] = 0.0f;
+    if (xr.key_world_pass) {
+        return (xr.hud_el == VR_HUD_EL_PHYSICAL_KEYS ||
+                xr.hud_el == VR_HUD_EL_PHYSICAL_BOSS_KEY) && g_vr_rect_world;
+    }
     if (xr.hud_world_pass) {
         // The pause frame: every HUD element (vitals, buttons with Return / Save / Decide, the
         // equip fly-in), measured only to know which corner it belongs to; the wrists keep their
@@ -5552,7 +5670,9 @@ void vr_begin_hud() {
             const float dark[4] = { 0.0f, tint * 0.4f * a, tint * a, a };
             vrgfx::Rect rects[3];
             int rect_count = 0;
-            for (int card = 0; card < 3; ++card) {
+            // Physical key cards render inside the stereo eye pass so the hand can occlude them.
+            // Only the ordinary wrist card remains an OpenXR compositor quad.
+            for (int card = 0; card < 1; ++card) {
                 if (!xr.hud_back_valid[hand][card]) continue;
                 const float* b = xr.hud_back[hand][card];
                 const int32_t x0 = (int32_t)(b[0] * sx), y0 = (int32_t)(b[1] * sy);
@@ -5607,6 +5727,29 @@ void vr_end_hud() {
 bool vr_is_rendering_hud() { return xr.rendering_hud; }
 
 bool vr_is_rendering_screen() { return xr.rendering_screen; }
+
+bool vr_begin_key_world_pass() {
+    if (!xr.initialized || !xr.frame_began || xr.rendering_hud || xr.rendering_screen ||
+        !vr_hud_wrist_layout() || xr.hud_commands == nullptr) return false;
+    xr.key_world_pass = true;
+    xr.key_world_saved_rect = g_vr_rect_world;
+    memcpy(xr.key_world_saved_mtx, g_vr_rect_world_mtx, sizeof(g_vr_rect_world_mtx));
+    g_vr_rect_world = false;
+    g_vr_hud_layout_pass = true;
+    xr.hud_el = VR_HUD_EL_NONE;
+    return true;
+}
+
+void vr_end_key_world_pass() {
+    if (!xr.key_world_pass) return;
+    xr.key_world_pass = false;
+    g_vr_hud_layout_pass = false;
+    g_vr_rect_world = xr.key_world_saved_rect;
+    memcpy(g_vr_rect_world_mtx, xr.key_world_saved_mtx, sizeof(g_vr_rect_world_mtx));
+    vr_rebind_current_eye_target();
+}
+
+bool vr_is_key_world_pass() { return xr.key_world_pass; }
 
 // --------------------------------------------------------------------------
 // Text panel (message system on its own soft-follow quad)
@@ -5960,6 +6103,9 @@ void* vr_get_hud_commands() { return nullptr; }
 void vr_begin_hud() {}
 void vr_end_hud() {}
 bool vr_is_rendering_hud() { return false; }
+bool vr_begin_key_world_pass() { return false; }
+void vr_end_key_world_pass() {}
+bool vr_is_key_world_pass() { return false; }
 void vr_set_text_commands(void*, const float*) {}
 void* vr_get_text_commands() { return nullptr; }
 void vr_set_text_panel_layout(float, float, float) {}

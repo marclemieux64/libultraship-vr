@@ -228,6 +228,11 @@ void vr_begin_hud();
 void vr_end_hud();
 bool vr_is_rendering_hud();
 bool vr_is_rendering_screen();
+// Replays only physical-key HUD rectangles into the active stereo eye pass. Their world transform
+// is also used by grabbing, so the rendered key and its target cannot diverge.
+bool vr_begin_key_world_pass();
+void vr_end_key_world_pass();
+bool vr_is_key_world_pass();
 
 // Text panel: the message system's display list (text boxes, ocarina staff) on its own quad that
 // soft-follows in front of the player in real metres. commands NULL = no text box showing (panel

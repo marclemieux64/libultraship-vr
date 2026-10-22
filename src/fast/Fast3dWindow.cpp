@@ -709,6 +709,7 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
             // layer at a fixed pose showing a menu, so the compositor resubmits it perfectly and
             // there is even less to lose than with the eyes.
             if (renderEyes) {
+                Gfx* keyHudCommands = static_cast<Gfx*>(vr_get_hud_commands());
                 if (gpuTimingFrame) vr_gpu_timing_phase_begin(0);
                 const auto eyesStart = std::chrono::steady_clock::now();
                 if (vr_get_flat_screen()) {
@@ -721,11 +722,19 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
                     // Single-pass stereo: one run fills both layers of the eye swapchain.
                     vr_begin_stereo();
                     mInterpreter->Run(commands, mtxReplacements);
+                    if (keyHudCommands != nullptr && vr_begin_key_world_pass()) {
+                        mInterpreter->Run(keyHudCommands, mtxReplacements);
+                        vr_end_key_world_pass();
+                    }
                     vr_end_stereo();
                 } else {
                     for (int eye = 0; eye < 2; eye++) {
                         vr_begin_eye(eye);
                         mInterpreter->Run(commands, mtxReplacements);
+                        if (keyHudCommands != nullptr && vr_begin_key_world_pass()) {
+                            mInterpreter->Run(keyHudCommands, mtxReplacements);
+                            vr_end_key_world_pass();
+                        }
                         vr_end_eye(eye);
                     }
                 }

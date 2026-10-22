@@ -2990,18 +2990,25 @@ void Interpreter::GfxDrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_
 
     struct XYWidthHeight viewport_saved = mRdp->viewport;
     uint32_t geometry_mode_saved = mRsp->geometry_mode;
+    uint32_t other_mode_l_saved = mRdp->other_mode_l;
 
     AdjustVIewportOrScissor(&default_viewport);
 
     mRdp->viewport = default_viewport;
     mRdp->viewport_or_scissor_changed = true;
     mRsp->geometry_mode = 0;
+    // Physical key cards are real eye-pass quads. Test them against the world's existing depth so
+    // the rendered hand can pass in front, but do not write depth and mask later transparent pixels.
+    if (mVrRectWorldMapped && vr_is_key_world_pass()) {
+        mRdp->other_mode_l = (mRdp->other_mode_l | Z_CMP) & ~Z_UPD;
+    }
 
     GfxSpTri1(MAX_VERTICES + 0, MAX_VERTICES + 1, MAX_VERTICES + 3, true);
     GfxSpTri1(MAX_VERTICES + 1, MAX_VERTICES + 2, MAX_VERTICES + 3, true);
     mVrRectWorldMapped = false;
 
     mRsp->geometry_mode = geometry_mode_saved;
+    mRdp->other_mode_l = other_mode_l_saved;
     mRdp->viewport = viewport_saved;
     mRdp->viewport_or_scissor_changed = true;
 
