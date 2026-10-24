@@ -163,6 +163,11 @@ void VR_ClampRoomscaleLean(float max_units);
 #define VR_BTN_SECONDARY  (1 << 3)
 #define VR_BTN_THUMBCLICK (1 << 4)
 #define VR_BTN_MENU       (1 << 5)
+// Native Frame: left D-pad left/right, right X/Y, and each hand's shoulder.
+#define VR_BTN_EXTRA1     (1 << 6)
+#define VR_BTN_EXTRA2     (1 << 7)
+#define VR_BTN_SHOULDER   (1 << 8)
+#define VR_BUTTON_COUNT   9
 
 // Controller grip pose in game-world coords (eye/anchor frame): pos in game units, quat is x,y,z,w.
 // Returns false (and identity) if that hand isn't tracked. Buttons/sticks/trigger/grip per hand.
@@ -200,6 +205,11 @@ void     VR_RequestFaceYaw(int16_t yawBinang);
 // forward direction. This is the ray for weapon aiming (slingshot/bow/hookshot).
 bool     VR_GetAimRay(int hand, float pos[3], float dir[3]);
 bool     VR_IsHandActive(int hand);
+// Active interaction profile, not the headset model.
+bool     VR_IsFrameController(int hand);
+// Binding editor only: physical action state before modal gameplay filtering (zero when unfocused).
+uint16_t VR_GetBindingButtons(int hand);
+void     VR_GetBindingThumbstick(int hand, float* x, float* y);
 uint16_t VR_GetControllerButton(int hand);
 void     VR_GetThumbstick(int hand, float* x, float* y);
 float    VR_GetTrigger(int hand);

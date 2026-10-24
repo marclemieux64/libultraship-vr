@@ -223,6 +223,12 @@ static struct {
     XrAction thumbstick_click_action;  // BOOL
     XrAction primary_action;           // BOOL: A (right) / X (left)
     XrAction secondary_action;         // BOOL: B (right) / Y (left)
+    bool frame_controller_supported;
+    bool profiles_dirty;
+    XrPath interaction_profile[2];
+    bool frame_controller[2];
+    XrAction extra_button_action[2]; // Frame: left D-pad left/right, right X/Y
+    XrAction shoulder_action;       // Separate from the analog trigger
     XrAction menu_action;              // BOOL
     XrAction haptic_action;            // VIBRATION_OUTPUT (per-hand subaction)
     XrSpace grip_space[2];
@@ -251,6 +257,9 @@ static struct {
     float squeeze_value[2];
     float thumbstick_x[2];
     float thumbstick_y[2];
+    // Unfiltered action snapshot for binding capture; gameplay keeps using the modal-filtered state.
+    uint16_t binding_buttons[2];
+    float binding_stick_x[2], binding_stick_y[2];
     uint16_t buttons[2];               // VR_BTN_* bitmask per hand
     // Hand velocities this frame (RAW tracking space) from XrSpaceVelocity chained into the grip
     // locate. hand_vel_valid distinguishes "runtime reported them" from "left at zero" so the
@@ -961,10 +970,33 @@ static void vr_update_visibility_masks() {
     }
 }
 
+static void update_interaction_profiles() {
+    if (!xr.input_initialized || !xr.profiles_dirty) return;
+    xr.profiles_dirty = false;
+    for (int h = 0; h < 2; h++) {
+        XrInteractionProfileState state = { XR_TYPE_INTERACTION_PROFILE_STATE };
+        if (XR_FAILED(xrGetCurrentInteractionProfile(xr.session, xr.hand_path[h], &state))) {
+            xr.profiles_dirty = true;
+            continue;
+        }
+        if (state.interactionProfile == xr.interaction_profile[h]) continue;
+        xr.interaction_profile[h] = state.interactionProfile;
+        char name[XR_MAX_PATH_LENGTH] = {};
+        uint32_t length = 0;
+        if (state.interactionProfile != XR_NULL_PATH) {
+            xrPathToString(xr.instance, state.interactionProfile, sizeof(name), &length, name);
+        }
+        xr.frame_controller[h] = strcmp(name, "/interaction_profiles/valve/frame_controller_valve") == 0;
+        spdlog::info("[VR Input] hand={} profile={}", h, name[0] ? name : "none");
+    }
+}
+
 static void poll_events() {
     XrEventDataBuffer event = { XR_TYPE_EVENT_DATA_BUFFER };
     while (xrPollEvent(xr.instance, &event) == XR_SUCCESS) {
-        if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
+        if (event.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {
+            xr.profiles_dirty = true;
+        } else if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
             auto* state_event = reinterpret_cast<XrEventDataSessionStateChanged*>(&event);
             handle_session_state_change(state_event->state);
         } else if (event.type == XR_TYPE_EVENT_DATA_USER_PRESENCE_CHANGED_EXT) {
@@ -1054,6 +1086,9 @@ static bool setup_input() {
                       &xr.thumbstick_click_action);
     ok &= make_action("primary", "Primary Button", XR_ACTION_TYPE_BOOLEAN_INPUT, &xr.primary_action);
     ok &= make_action("secondary", "Secondary Button", XR_ACTION_TYPE_BOOLEAN_INPUT, &xr.secondary_action);
+    ok &= make_action("extra_1", "Extra Button 1", XR_ACTION_TYPE_BOOLEAN_INPUT, &xr.extra_button_action[0]);
+    ok &= make_action("extra_2", "Extra Button 2", XR_ACTION_TYPE_BOOLEAN_INPUT, &xr.extra_button_action[1]);
+    ok &= make_action("shoulder", "Shoulder Button", XR_ACTION_TYPE_BOOLEAN_INPUT, &xr.shoulder_action);
     ok &= make_action("menu", "Menu", XR_ACTION_TYPE_BOOLEAN_INPUT, &xr.menu_action);
     ok &= make_action("haptic", "Haptic Feedback", XR_ACTION_TYPE_VIBRATION_OUTPUT, &xr.haptic_action);
     if (!ok) return false;
@@ -1127,6 +1162,50 @@ static bool setup_input() {
               { xr.haptic_action, path("/user/hand/left/output/haptic") },
               { xr.haptic_action, path("/user/hand/right/output/haptic") } });
 
+    // Native Frame inputs must remain independent; Touch compatibility can alias physical controls.
+    // https://partner.steamgames.com/doc/steamhardware/steamframe/input
+    if (xr.frame_controller_supported) {
+        std::vector<XrActionSuggestedBinding> binds;
+        size_t shoulder_index[2];
+        for (int h = 0; h < 2; h++) {
+            const std::string hand = h == 0 ? "/user/hand/left" : "/user/hand/right";
+            auto bind = [&](XrAction action, const char* component) {
+                binds.push_back({ action, path((hand + component).c_str()) });
+            };
+            bind(xr.grip_pose_action, "/input/grip/pose");
+            bind(xr.aim_pose_action, "/input/aim/pose");
+            bind(xr.trigger_action, "/input/trigger/value");
+            bind(xr.squeeze_action, "/input/squeeze/value");
+            bind(xr.thumbstick_action, "/input/thumbstick");
+            bind(xr.thumbstick_click_action, "/input/thumbstick/click");
+            bind(xr.primary_action, h == 0 ? "/input/dpad_down/click" : "/input/a/click");
+            bind(xr.secondary_action, h == 0 ? "/input/dpad_up/click" : "/input/b/click");
+            bind(xr.extra_button_action[0], h == 0 ? "/input/dpad_left/click" : "/input/x/click");
+            bind(xr.extra_button_action[1], h == 0 ? "/input/dpad_right/click" : "/input/y/click");
+            bind(xr.menu_action, h == 0 ? "/input/view/click" : "/input/menu/click");
+            bind(xr.haptic_action, "/output/haptic");
+            shoulder_index[h] = binds.size();
+            bind(xr.shoulder_action, "/input/shoulder/click");
+        }
+        XrInteractionProfileSuggestedBinding sb = { XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
+        sb.interactionProfile = path("/interaction_profiles/valve/frame_controller_valve");
+        sb.countSuggestedBindings = static_cast<uint32_t>(binds.size());
+        sb.suggestedBindings = binds.data();
+        XrResult result = xrSuggestInteractionProfileBindings(xr.instance, &sb);
+        if (result == XR_ERROR_PATH_UNSUPPORTED) {
+            // Older SteamVR versions called this component bumper instead of shoulder.
+            for (int h = 0; h < 2; h++) {
+                binds[shoulder_index[h]].binding = path(h == 0 ? "/user/hand/left/input/bumper/click"
+                                                        : "/user/hand/right/input/bumper/click");
+            }
+            spdlog::info("[VR Input] Retrying Frame profile with legacy bumper paths");
+            result = xrSuggestInteractionProfileBindings(xr.instance, &sb);
+        }
+        if (xr_check(result, "xrSuggestInteractionProfileBindings (Frame)")) {
+            spdlog::info("[VR Input] Native Frame bindings suggested (independent face/D-pad/shoulder inputs)");
+        }
+    }
+
     XrSessionActionSetsAttachInfo attach = { XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO };
     attach.countActionSets = 1;
     attach.actionSets = &xr.action_set;
@@ -1145,6 +1224,7 @@ static bool setup_input() {
     }
 
     xr.input_initialized = true;
+    xr.profiles_dirty = true;
     spdlog::info("[VR] Motion-control input initialized");
     return true;
 }
@@ -1153,6 +1233,10 @@ static bool setup_input() {
 // views are located, with the same predicted display time. Safe to call before the session is focused
 // (everything reads inactive -> zeros).
 static void update_input() {
+    for (int h = 0; h < 2; h++) {
+        xr.binding_buttons[h] = 0;
+        xr.binding_stick_x[h] = xr.binding_stick_y[h] = 0.0f;
+    }
     if (!xr.input_initialized) return;
 
     XrActiveActionSet active = { xr.action_set, XR_NULL_PATH };
@@ -1163,6 +1247,7 @@ static void update_input() {
         return;
     }
 
+    update_interaction_profiles();
     const XrTime t = xr.frame_state.predictedDisplayTime;
 
     for (int h = 0; h < 2; h++) {
@@ -1230,6 +1315,8 @@ static void update_input() {
         } else {
             xr.thumbstick_x[h] = xr.thumbstick_y[h] = 0.0f;
         }
+        xr.binding_stick_x[h] = xr.thumbstick_x[h];
+        xr.binding_stick_y[h] = xr.thumbstick_y[h];
         // Modal hand gestures (the Alyx-style item selector) suppress a hand's stick at the
         // SOURCE, so every consumer — movement, artificial turning, stick C-buttons — inherits
         // it: holding a stick-click gesture cannot steer, turn or fire items.
@@ -1245,6 +1332,10 @@ static void update_input() {
         if (get_bool(xr.secondary_action)) b |= (1 << 3);        // VR_BTN_SECONDARY
         if (get_bool(xr.thumbstick_click_action)) b |= (1 << 4); // VR_BTN_THUMBCLICK
         if (get_bool(xr.menu_action)) b |= (1 << 5);             // VR_BTN_MENU
+        if (get_bool(xr.extra_button_action[0])) b |= VR_BTN_EXTRA1;
+        if (get_bool(xr.extra_button_action[1])) b |= VR_BTN_EXTRA2;
+        if (get_bool(xr.shoulder_action)) b |= VR_BTN_SHOULDER;
+        xr.binding_buttons[h] = b;
         xr.buttons[h] = b;
     }
 }
@@ -2016,6 +2107,7 @@ static bool vr_create_instance(const char* required_ext, const char* api_name, c
     // Optional extensions are enabled only when the runtime offers them; the backend's graphics
     // extension is required, and checked rather than assumed.
     vr_log_openxr_environment();
+    xr.frame_controller_supported = false;
     xr.user_presence_supported = false;
     xr.color_scale_supported = false;
     xr.perf_settings_supported = false;
@@ -2030,6 +2122,9 @@ static bool vr_create_instance(const char* required_ext, const char* api_name, c
         std::vector<XrExtensionProperties> ext_props(ext_count, { XR_TYPE_EXTENSION_PROPERTIES });
         xrEnumerateInstanceExtensionProperties(nullptr, ext_count, &ext_count, ext_props.data());
         for (const auto& p : ext_props) {
+            if (strcmp(p.extensionName, "XR_VALVE_frame_controller_interaction") == 0) {
+                xr.frame_controller_supported = true;
+            }
             if (strcmp(p.extensionName, XR_EXT_USER_PRESENCE_EXTENSION_NAME) == 0) {
                 xr.user_presence_supported = true;
             }
@@ -2058,6 +2153,10 @@ static bool vr_create_instance(const char* required_ext, const char* api_name, c
 
     std::vector<const char*> extensions = { required_ext };
     extensions.insert(extensions.end(), extra.begin(), extra.end());
+    if (xr.frame_controller_supported) {
+        extensions.push_back("XR_VALVE_frame_controller_interaction");
+        spdlog::info("[VR Input] Enabling XR_VALVE_frame_controller_interaction");
+    }
     if (xr.user_presence_supported) {
         extensions.push_back(XR_EXT_USER_PRESENCE_EXTENSION_NAME);
     }
@@ -4662,8 +4761,24 @@ bool vr_get_aim_ray(int hand, float out_pos[3], float out_dir[3]) {
     return true;
 }
 
+bool vr_is_frame_controller(int hand) {
+    return hand >= 0 && hand < 2 && xr.input_initialized && xr.frame_controller[hand];
+}
+
 bool vr_is_hand_active(int hand) {
     return (hand >= 0 && hand <= 1) && xr.input_initialized && xr.hand_active[hand];
+}
+
+uint16_t vr_get_binding_buttons(int hand) {
+    if (hand < 0 || hand > 1 || !xr.input_initialized || xr.session_state != XR_SESSION_STATE_FOCUSED) return 0;
+    return xr.binding_buttons[hand];
+}
+
+void vr_get_binding_thumbstick(int hand, float* x, float* y) {
+    *x = *y = 0.0f;
+    if (hand < 0 || hand > 1 || !xr.input_initialized || xr.session_state != XR_SESSION_STATE_FOCUSED) return;
+    *x = xr.binding_stick_x[hand];
+    *y = xr.binding_stick_y[hand];
 }
 
 uint16_t vr_get_controller_buttons(int hand) {
@@ -6044,7 +6159,10 @@ bool vr_get_hand_pose(int, float out_pos[3], float out_quat[4]) {
     out_quat[3] = 1.0f;
     return false;
 }
+bool vr_is_frame_controller(int) { return false; }
 bool vr_is_hand_active(int) { return false; }
+uint16_t vr_get_binding_buttons(int) { return 0; }
+void vr_get_binding_thumbstick(int, float* x, float* y) { *x = *y = 0.0f; }
 uint16_t vr_get_controller_buttons(int) { return 0; }
 void vr_get_thumbstick(int, float* x, float* y) { *x = *y = 0.0f; }
 void vr_set_turn_suppressed(bool) {}
